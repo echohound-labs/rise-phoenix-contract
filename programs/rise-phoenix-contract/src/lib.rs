@@ -12,7 +12,7 @@ declare_id!("5QUVVnm1duiRazqa69KW9ZQhCCZcg5GBUKkUn5avA8Gb");
 pub const TREASURY: Pubkey = pubkey!("DBvfCPxj2gSo4dbHxwMrLRhy9fCmbHLrWJUDkUny8hBG");
 pub const MAX_SUPPLY: u32 = 500;
 pub const MINT_PRICE: u64 = 10_000_000_000;
-pub const BASE_URI: &str = "https://rise-phoenix-x1.vercel.app/api/metadata/";
+pub const BASE_URI: &str = "https://rise-phoenix-nft.vercel.app/api/metadata/";
 
 #[program]
 pub mod rise_phoenix_contract {
