@@ -13,6 +13,7 @@ pub const TREASURY: Pubkey = pubkey!("DBvfCPxj2gSo4dbHxwMrLRhy9fCmbHLrWJUDkUny8h
 pub const MAX_SUPPLY: u32 = 500;
 pub const MINT_PRICE: u64 = 10_000_000_000;
 pub const BASE_URI: &str = "https://rise-phoenix-nft.vercel.app/api/metadata/";
+pub const GEIGER_PROGRAM: Pubkey = pubkey!("BxUNg2yo5371BQMZPkfcxdCptFRDHkhvEXNM1QNPBRYU");
 
 #[program]
 pub mod rise_phoenix_contract {
@@ -26,16 +27,82 @@ pub mod rise_phoenix_contract {
         Ok(())
     }
 
-    pub fn mint_phoenix(ctx: Context<MintPhoenix>) -> Result<()> {
+    // Step 1: Request randomness from Geiger Oracle
+    pub fn request_mint(ctx: Context<RequestMint>) -> Result<()> {
+        require!(
+            ctx.accounts.mint_state.total_minted < MAX_SUPPLY,
+            PhoenixError::SoldOut
+        );
+
+        // Build user seed from minter pubkey + slot
+        let clock = Clock::get()?;
+        let mut user_seed = [0u8; 32];
+        user_seed[..32].copy_from_slice(&ctx.accounts.minter.key().to_bytes());
+        user_seed[0] ^= (clock.slot & 0xff) as u8;
+
+        // CPI to Geiger request_randomness
+        let request_ix = anchor_lang::solana_program::instruction::Instruction {
+            program_id: GEIGER_PROGRAM,
+            accounts: vec![
+                anchor_lang::solana_program::instruction::AccountMeta::new(ctx.accounts.oracle_state.key(), false),
+                anchor_lang::solana_program::instruction::AccountMeta::new_readonly(ctx.accounts.entropy_pool.key(), false),
+                anchor_lang::solana_program::instruction::AccountMeta::new(ctx.accounts.randomness_request.key(), false),
+                anchor_lang::solana_program::instruction::AccountMeta::new(ctx.accounts.minter.key(), true),
+                anchor_lang::solana_program::instruction::AccountMeta::new_readonly(ctx.accounts.system_program.key(), false),
+            ],
+            data: {
+                let mut d = vec![213, 5, 173, 166, 37, 236, 31, 18]; // request_randomness discriminator
+                d.extend_from_slice(&user_seed);
+                d
+            },
+        };
+
+        anchor_lang::solana_program::program::invoke(
+            &request_ix,
+            &[
+                ctx.accounts.oracle_state.to_account_info(),
+                ctx.accounts.entropy_pool.to_account_info(),
+                ctx.accounts.randomness_request.to_account_info(),
+                ctx.accounts.minter.to_account_info(),
+                ctx.accounts.system_program.to_account_info(),
+            ],
+        )?;
+
+        // Store pending mint info
+        let pending = &mut ctx.accounts.pending_mint;
+        pending.minter = ctx.accounts.minter.key();
+        pending.randomness_request = ctx.accounts.randomness_request.key();
+        pending.bump = ctx.bumps.pending_mint;
+        pending.slot_requested = clock.slot;
+
+        Ok(())
+    }
+
+    // Step 2: Fulfill mint after randomness is ready
+    pub fn fulfill_mint(ctx: Context<FulfillMint>) -> Result<()> {
         let total_minted = ctx.accounts.mint_state.total_minted;
         let bump = ctx.accounts.mint_state.bump;
         require!(total_minted < MAX_SUPPLY, PhoenixError::SoldOut);
 
-        let mint_number = total_minted;
+        // Read random result from Geiger RandomnessRequest account
+        let request_data = ctx.accounts.randomness_request.try_borrow_data()?;
+        // Skip discriminator (8) + requester (32) + user_seed (32) = offset 72
+        let result = &request_data[72..104];
+        
+        // Check status is Fulfilled (offset 104, status byte should be 1)
+        require!(request_data[104] == 1, PhoenixError::RandomnessNotReady);
+
+        // Use random bytes to pick NFT number from remaining supply
+        let random_u32 = u32::from_le_bytes([result[0], result[1], result[2], result[3]]);
+        let remaining = MAX_SUPPLY - total_minted;
+        let mint_number = total_minted + (random_u32 % remaining);
+
+        drop(request_data);
+
         let seeds = &[b"mint_state".as_ref(), &[bump]];
         let signer_seeds = &[&seeds[..]];
 
-        // 1. Mint 1 token to minter ATA
+        // 1. Mint 1 token
         token::mint_to(
             CpiContext::new_with_signer(
                 ctx.accounts.token_program.to_account_info(),
@@ -52,13 +119,7 @@ pub mod rise_phoenix_contract {
         // 2. Create metadata
         let uri = format!("{}{}", BASE_URI, mint_number);
         let name = format!("RISE Phoenix #{}", mint_number + 1);
-        let tier = if mint_number < 400 {
-            "Ember"
-        } else if mint_number < 475 {
-            "Blaze"
-        } else {
-            "Genesis"
-        };
+        let tier = if mint_number < 400 { "Ember" } else if mint_number < 475 { "Blaze" } else { "Genesis" };
 
         create_metadata_accounts_v3(
             CpiContext::new_with_signer(
@@ -80,8 +141,8 @@ pub mod rise_phoenix_contract {
                 uri,
                 seller_fee_basis_points: 500,
                 creators: Some(vec![Creator {
-                    address: ctx.accounts.mint_state.key(),
-                    verified: true,
+                    address: TREASURY,
+                    verified: false,
                     share: 100,
                 }]),
                 collection: None,
@@ -92,7 +153,7 @@ pub mod rise_phoenix_contract {
             None,
         )?;
 
-        // 3. Transfer 10 XNT to treasury LAST
+        // 3. Transfer 10 XNT to treasury
         let transfer_ix = anchor_lang::solana_program::system_instruction::transfer(
             &ctx.accounts.minter.key(),
             &ctx.accounts.treasury.key(),
@@ -136,15 +197,45 @@ pub struct Initialize<'info> {
 }
 
 #[derive(Accounts)]
-pub struct MintPhoenix<'info> {
-    #[account(
-        mut,
-        seeds = [b"mint_state"],
-        bump = mint_state.bump
-    )]
+pub struct RequestMint<'info> {
+    #[account(mut, seeds = [b"mint_state"], bump = mint_state.bump)]
     pub mint_state: Account<'info, MintState>,
     #[account(mut)]
     pub minter: Signer<'info>,
+    #[account(
+        init,
+        payer = minter,
+        space = 8 + 32 + 32 + 1 + 8,
+        seeds = [b"pending_mint", minter.key().as_ref()],
+        bump
+    )]
+    pub pending_mint: Account<'info, PendingMint>,
+    /// CHECK: Geiger oracle state PDA
+    #[account(mut)]
+    pub oracle_state: UncheckedAccount<'info>,
+    /// CHECK: Geiger entropy pool PDA
+    pub entropy_pool: UncheckedAccount<'info>,
+    /// CHECK: Geiger randomness request PDA
+    #[account(mut)]
+    pub randomness_request: UncheckedAccount<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct FulfillMint<'info> {
+    #[account(mut, seeds = [b"mint_state"], bump = mint_state.bump)]
+    pub mint_state: Account<'info, MintState>,
+    #[account(mut)]
+    pub minter: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [b"pending_mint", minter.key().as_ref()],
+        bump = pending_mint.bump,
+        close = minter
+    )]
+    pub pending_mint: Account<'info, PendingMint>,
+    /// CHECK: Geiger randomness request - verified via pending_mint
+    pub randomness_request: UncheckedAccount<'info>,
     #[account(
         init,
         payer = minter,
@@ -180,6 +271,14 @@ pub struct MintState {
     pub bump: u8,
 }
 
+#[account]
+pub struct PendingMint {
+    pub minter: Pubkey,
+    pub randomness_request: Pubkey,
+    pub bump: u8,
+    pub slot_requested: u64,
+}
+
 #[event]
 pub struct MintEvent {
     pub mint_number: u32,
@@ -191,4 +290,6 @@ pub struct MintEvent {
 pub enum PhoenixError {
     #[msg("All 500 phoenixes have been minted")]
     SoldOut,
+    #[msg("Randomness not yet fulfilled by Geiger Oracle")]
+    RandomnessNotReady,
 }
