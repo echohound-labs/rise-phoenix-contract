@@ -13,7 +13,7 @@ pub const TREASURY: Pubkey = pubkey!("DBvfCPxj2gSo4dbHxwMrLRhy9fCmbHLrWJUDkUny8h
 pub const MAX_SUPPLY: u32 = 500;
 pub const MINT_PRICE: u64 = 10_000_000_000;
 pub const BASE_URI: &str = "https://rise-phoenix-nft.vercel.app/api/metadata/";
-pub const GEIGER_PROGRAM: Pubkey = pubkey!("BxUNg2yo5371BQMZPkfcxdCptFRDHkhvEXNM1QNPBRYU");
+pub const GEIGER_PROGRAM: Pubkey = pubkey!("2dQf9uaCzXewrDNLttmtzQmc3SmqfAHz3qahKQjtGQyY");
 
 #[program]
 pub mod rise_phoenix_contract {
