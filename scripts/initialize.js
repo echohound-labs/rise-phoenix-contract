@@ -4,11 +4,12 @@ const fs = require("fs");
 const path = require("path");
 
 async function main() {
-  const connection = new Connection("https://rpc.testnet.x1.xyz", "confirmed");
+  const rpcUrl = process.env.RPC_URL || "https://rpc.testnet.x1.xyz";
+  const connection = new Connection(rpcUrl, "confirmed");
   
   const walletKeypair = Keypair.fromSecretKey(
     Buffer.from(JSON.parse(fs.readFileSync(
-      path.join(process.env.HOME, ".config/solana/rise-mint-authority.json")
+      process.env.KEYPAIR_PATH || path.join(process.env.HOME, ".config/solana/rise-mint-authority.json")
     )))
   );
 
@@ -20,11 +21,11 @@ async function main() {
     path.join(__dirname, "../target/idl/rise_phoenix_contract.json")
   ));
 
-  const programId = new PublicKey("5QUVVnm1duiRazqa69KW9ZQhCCZcg5GBUKkUn5avA8Gb");
+  const programId = new PublicKey(process.env.PROGRAM_ID || "5QUVVnm1duiRazqa69KW9ZQhCCZcg5GBUKkUn5avA8Gb");
   const program = new anchor.Program(idl, provider);
 
   const [mintStatePDA] = PublicKey.findProgramAddressSync(
-    [Buffer.from("mint_state")],
+    [Buffer.from("mint_state_v2")],
     programId
   );
 

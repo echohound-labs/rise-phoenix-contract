@@ -9,7 +9,7 @@ use anchor_spl::token::{self, Mint, MintTo, Token, TokenAccount};
 
 declare_id!("5QUVVnm1duiRazqa69KW9ZQhCCZcg5GBUKkUn5avA8Gb");
 
-pub const TREASURY: Pubkey = pubkey!("DBvfCPxj2gSo4dbHxwMrLRhy9fCmbHLrWJUDkUny8hBG");
+pub const TREASURY: Pubkey = pubkey!("Gowv5PDb7K4a5PwjubWegvBT4CDfjjJcG4QAZWa9yUob");
 pub const MAX_SUPPLY: u32 = 500;
 pub const MINT_PRICE: u64 = 10_000_000_000;
 pub const BASE_URI: &str = "https://rise-phoenix-nft.vercel.app/api/metadata/";
@@ -18,6 +18,14 @@ pub const GEIGER_PROGRAM: Pubkey = pubkey!("2dQf9uaCzXewrDNLttmtzQmc3SmqfAHz3qah
 #[program]
 pub mod rise_phoenix_contract {
     use super::*;
+
+    pub fn close_pending_mint(ctx: Context<ClosePendingMint>) -> Result<()> {
+        Ok(())
+    }
+
+    pub fn close_mint_state(ctx: Context<CloseMintState>) -> Result<()> {
+        Ok(())
+    }
 
     pub fn initialize(ctx: Context<Initialize>) -> Result<()> {
         let state = &mut ctx.accounts.mint_state;
@@ -92,14 +100,32 @@ pub mod rise_phoenix_contract {
         // Check status is Fulfilled (offset 104, status byte should be 1)
         require!(request_data[104] == 1, PhoenixError::RandomnessNotReady);
 
-        // Use random bytes to pick NFT number from remaining supply
+        // Use random bytes to pick NFT number from full range (0-499)
         let random_u32 = u32::from_le_bytes([result[0], result[1], result[2], result[3]]);
-        let remaining = MAX_SUPPLY - total_minted;
-        let mint_number = total_minted + (random_u32 % remaining);
+        let mut candidate = (random_u32 % MAX_SUPPLY) as usize;
+        
+        // Find first unminted slot starting from random candidate
+        let mut mint_number = candidate as u32;
+        for _ in 0..MAX_SUPPLY {
+            let byte_idx = candidate / 64;
+            let bit_idx = candidate % 64;
+            let is_minted = (ctx.accounts.mint_state.minted_bitmap[byte_idx] & (1u64 << bit_idx)) != 0;
+            
+            if !is_minted {
+                mint_number = candidate as u32;
+                break;
+            }
+            candidate = (candidate + 1) % (MAX_SUPPLY as usize);
+        }
+        
+        // Mark this NFT as minted in bitmap
+        let byte_idx = mint_number as usize / 64;
+        let bit_idx = mint_number as usize % 64;
+        ctx.accounts.mint_state.minted_bitmap[byte_idx] |= 1u64 << bit_idx;
 
         drop(request_data);
 
-        let seeds = &[b"mint_state".as_ref(), &[bump]];
+        let seeds = &[b"mint_state_v2".as_ref(), &[bump]];
         let signer_seeds = &[&seeds[..]];
 
         // 1. Mint 1 token
@@ -118,7 +144,7 @@ pub mod rise_phoenix_contract {
 
         // 2. Create metadata
         let uri = format!("{}{}", BASE_URI, mint_number);
-        let name = format!("RISE Phoenix #{}", mint_number + 1);
+        let name = format!("RISE Phoenix #{}", mint_number);
         let tier = if mint_number < 400 { "Ember" } else if mint_number < 475 { "Blaze" } else { "Genesis" };
 
         create_metadata_accounts_v3(
@@ -186,8 +212,8 @@ pub struct Initialize<'info> {
     #[account(
         init,
         payer = authority,
-        space = 8 + 4 + 32 + 1,
-        seeds = [b"mint_state"],
+        space = 8 + 4 + 32 + 1 + 64,  // Added 64 bytes for bitmap
+        seeds = [b"mint_state_v2"],
         bump
     )]
     pub mint_state: Account<'info, MintState>,
@@ -198,7 +224,7 @@ pub struct Initialize<'info> {
 
 #[derive(Accounts)]
 pub struct RequestMint<'info> {
-    #[account(mut, seeds = [b"mint_state"], bump = mint_state.bump)]
+    #[account(mut, seeds = [b"mint_state_v2"], bump = mint_state.bump)]
     pub mint_state: Account<'info, MintState>,
     #[account(mut)]
     pub minter: Signer<'info>,
@@ -215,15 +241,17 @@ pub struct RequestMint<'info> {
     pub oracle_state: UncheckedAccount<'info>,
     /// CHECK: Geiger entropy pool PDA
     pub entropy_pool: UncheckedAccount<'info>,
-    /// CHECK: Geiger randomness request PDA
+    /// CHECK: Geiger randomness request PDA (created by Geiger program)
     #[account(mut)]
     pub randomness_request: UncheckedAccount<'info>,
+    /// CHECK: Geiger program for CPI
+    pub geiger_program: UncheckedAccount<'info>,
     pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
 pub struct FulfillMint<'info> {
-    #[account(mut, seeds = [b"mint_state"], bump = mint_state.bump)]
+    #[account(mut, seeds = [b"mint_state_v2"], bump = mint_state.bump)]
     pub mint_state: Account<'info, MintState>,
     #[account(mut)]
     pub minter: Signer<'info>,
@@ -245,7 +273,7 @@ pub struct FulfillMint<'info> {
     )]
     pub nft_mint: Account<'info, Mint>,
     #[account(
-        init_if_needed,
+        init,
         payer = minter,
         associated_token::mint = nft_mint,
         associated_token::authority = minter,
@@ -269,6 +297,7 @@ pub struct MintState {
     pub total_minted: u32,
     pub authority: Pubkey,
     pub bump: u8,
+    pub minted_bitmap: [u64; 8],  // 64 bytes = 512 bits (enough for 500 NFTs)
 }
 
 #[account]
@@ -284,6 +313,33 @@ pub struct MintEvent {
     pub mint_number: u32,
     pub tier: String,
     pub minter: Pubkey,
+}
+
+
+#[derive(Accounts)]
+pub struct CloseMintState<'info> {
+    #[account(
+        mut,
+        seeds = [b"mint_state_v2"],
+        bump = mint_state.bump,
+        close = authority
+    )]
+    pub mint_state: Account<'info, MintState>,
+    #[account(mut)]
+    pub authority: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct ClosePendingMint<'info> {
+    #[account(
+        mut,
+        seeds = [b"pending_mint", minter.key().as_ref()],
+        bump = pending_mint.bump,
+        close = minter
+    )]
+    pub pending_mint: Account<'info, PendingMint>,
+    #[account(mut)]
+    pub minter: Signer<'info>,
 }
 
 #[error_code]
