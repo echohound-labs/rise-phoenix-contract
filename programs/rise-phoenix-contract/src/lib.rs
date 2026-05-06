@@ -12,6 +12,9 @@ declare_id!("5QUVVnm1duiRazqa69KW9ZQhCCZcg5GBUKkUn5avA8Gb");
 pub const TREASURY: Pubkey = pubkey!("Gowv5PDb7K4a5PwjubWegvBT4CDfjjJcG4QAZWa9yUob");
 pub const MAX_SUPPLY: u32 = 500;
 pub const MINT_PRICE: u64 = 10_000_000_000;
+pub const ORACLE_FEE: u64 = 1_000_000_000; // 1 XNT to oracle operator
+pub const TREASURY_AMOUNT: u64 = 9_000_000_000; // 9 XNT to treasury
+pub const ORACLE_OPERATOR: Pubkey = pubkey!("HGFisVbULNKqogtPuGTfcHG9y6i5nboZabYwifkiiodo");
 pub const BASE_URI: &str = "https://rise-phoenix-nft.vercel.app/api/metadata/";
 pub const GEIGER_PROGRAM: Pubkey = pubkey!("2dQf9uaCzXewrDNLttmtzQmc3SmqfAHz3qahKQjtGQyY");
 
@@ -179,17 +182,31 @@ pub mod rise_phoenix_contract {
             None,
         )?;
 
-        // 3. Transfer 10 XNT to treasury
+        // 3a. Transfer 9 XNT to treasury (buy & burn)
         let transfer_ix = anchor_lang::solana_program::system_instruction::transfer(
             &ctx.accounts.minter.key(),
             &ctx.accounts.treasury.key(),
-            MINT_PRICE,
+            TREASURY_AMOUNT,
         );
         anchor_lang::solana_program::program::invoke(
             &transfer_ix,
             &[
                 ctx.accounts.minter.to_account_info(),
                 ctx.accounts.treasury.to_account_info(),
+                ctx.accounts.system_program.to_account_info(),
+            ],
+        )?;
+        // 3b. Transfer 1 XNT to Geiger Oracle operator
+        let oracle_ix = anchor_lang::solana_program::system_instruction::transfer(
+            &ctx.accounts.minter.key(),
+            &ORACLE_OPERATOR,
+            ORACLE_FEE,
+        );
+        anchor_lang::solana_program::program::invoke(
+            &oracle_ix,
+            &[
+                ctx.accounts.minter.to_account_info(),
+                ctx.accounts.oracle_operator.to_account_info(),
                 ctx.accounts.system_program.to_account_info(),
             ],
         )?;
@@ -252,7 +269,7 @@ pub struct RequestMint<'info> {
 #[derive(Accounts)]
 pub struct FulfillMint<'info> {
     #[account(mut, seeds = [b"mint_state_v2"], bump = mint_state.bump)]
-    pub mint_state: Account<'info, MintState>,
+    pub mint_state: Box<Account<'info, MintState>>,
     #[account(mut)]
     pub minter: Signer<'info>,
     #[account(
@@ -261,7 +278,7 @@ pub struct FulfillMint<'info> {
         bump = pending_mint.bump,
         close = minter
     )]
-    pub pending_mint: Account<'info, PendingMint>,
+    pub pending_mint: Box<Account<'info, PendingMint>>,
     /// CHECK: Geiger randomness request - verified via pending_mint
     pub randomness_request: UncheckedAccount<'info>,
     #[account(
@@ -271,20 +288,23 @@ pub struct FulfillMint<'info> {
         mint::authority = mint_state,
         mint::freeze_authority = mint_state,
     )]
-    pub nft_mint: Account<'info, Mint>,
+    pub nft_mint: Box<Account<'info, Mint>>,
     #[account(
         init,
         payer = minter,
         associated_token::mint = nft_mint,
         associated_token::authority = minter,
     )]
-    pub minter_ata: Account<'info, TokenAccount>,
+    pub minter_ata: Box<Account<'info, TokenAccount>>,
     /// CHECK: Metaplex metadata PDA
     #[account(mut)]
     pub metadata: UncheckedAccount<'info>,
     /// CHECK: treasury wallet
     #[account(mut, address = TREASURY)]
     pub treasury: AccountInfo<'info>,
+    /// CHECK: oracle operator wallet
+    #[account(mut, address = ORACLE_OPERATOR)]
+    pub oracle_operator: AccountInfo<'info>,
     pub token_program: Program<'info, Token>,
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
