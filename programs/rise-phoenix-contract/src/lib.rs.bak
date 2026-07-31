@@ -207,26 +207,6 @@ pub mod rise_phoenix_contract {
             None,
         )?;
 
-        // Master Edition: hands mint authority to Metaplex, supply locked at 1
-        create_master_edition_v3(
-            CpiContext::new_with_signer(
-                ctx.accounts.token_metadata_program.to_account_info(),
-                CreateMasterEditionV3 {
-                    edition: ctx.accounts.master_edition.to_account_info(),
-                    mint: ctx.accounts.nft_mint.to_account_info(),
-                    update_authority: ctx.accounts.mint_state.to_account_info(),
-                    mint_authority: ctx.accounts.mint_state.to_account_info(),
-                    payer: ctx.accounts.minter.to_account_info(),
-                    metadata: ctx.accounts.metadata.to_account_info(),
-                    token_program: ctx.accounts.token_program.to_account_info(),
-                    system_program: ctx.accounts.system_program.to_account_info(),
-                    rent: ctx.accounts.rent.to_account_info(),
-                },
-                signer_seeds,
-            ),
-            Some(0),
-        )?;
-
         // Transfer 1 XNT to Geiger Oracle operator
         let oracle_ix = anchor_lang::solana_program::system_instruction::transfer(
             &ctx.accounts.minter.key(),
@@ -250,36 +230,6 @@ pub mod rise_phoenix_contract {
             tier: tier.to_string(),
             minter: ctx.accounts.minter.key(),
         });
-
-        Ok(())
-    }
-
-    // ── CERT: give an already-minted member its Master Edition ──
-    // Moves mint authority from mint_state into the Master Edition PDA, so extra
-    // supply becomes impossible by construction. Authority-gated backfill.
-    pub fn create_member_master_edition(ctx: Context<CreateMemberMasterEdition>) -> Result<()> {
-        let bump = ctx.accounts.mint_state.bump;
-        let seeds = &[b"mint_state_v2".as_ref(), &[bump]];
-        let signer = &[&seeds[..]];
-
-        create_master_edition_v3(
-            CpiContext::new_with_signer(
-                ctx.accounts.token_metadata_program.to_account_info(),
-                CreateMasterEditionV3 {
-                    edition: ctx.accounts.master_edition.to_account_info(),
-                    mint: ctx.accounts.nft_mint.to_account_info(),
-                    update_authority: ctx.accounts.mint_state.to_account_info(),
-                    mint_authority: ctx.accounts.mint_state.to_account_info(),
-                    payer: ctx.accounts.authority.to_account_info(),
-                    metadata: ctx.accounts.metadata.to_account_info(),
-                    token_program: ctx.accounts.token_program.to_account_info(),
-                    system_program: ctx.accounts.system_program.to_account_info(),
-                    rent: ctx.accounts.rent.to_account_info(),
-                },
-                signer,
-            ),
-            Some(0),
-        )?;
 
         Ok(())
     }
@@ -538,9 +488,6 @@ pub struct FulfillMint<'info> {
     pub collection_metadata: UncheckedAccount<'info>,
     /// CHECK: parent collection master edition
     pub collection_master_edition: UncheckedAccount<'info>,
-    /// CHECK: member master edition PDA, created by the CPI
-    #[account(mut)]
-    pub master_edition: UncheckedAccount<'info>,
 }
 
 #[account]
@@ -566,27 +513,6 @@ pub struct MintEvent {
     pub minter: Pubkey,
 }
 
-
-#[derive(Accounts)]
-pub struct CreateMemberMasterEdition<'info> {
-    #[account(seeds = [b"mint_state_v2"], bump = mint_state.bump, has_one = authority)]
-    pub mint_state: Account<'info, MintState>,
-    #[account(mut)]
-    pub authority: Signer<'info>,
-    /// CHECK: member NFT metadata, read by the CPI
-    #[account(mut)]
-    pub metadata: UncheckedAccount<'info>,
-    /// CHECK: member NFT mint — authority moves into the master edition PDA
-    #[account(mut)]
-    pub nft_mint: UncheckedAccount<'info>,
-    /// CHECK: master edition PDA, created by the CPI
-    #[account(mut)]
-    pub master_edition: UncheckedAccount<'info>,
-    pub token_metadata_program: Program<'info, Metadata>,
-    pub token_program: Program<'info, Token>,
-    pub system_program: Program<'info, System>,
-    pub rent: Sysvar<'info, Rent>,
-}
 
 #[derive(Accounts)]
 pub struct CloseMintState<'info> {
