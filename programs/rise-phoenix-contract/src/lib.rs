@@ -456,7 +456,7 @@ pub struct Initialize<'info> {
         bump
     )]
     pub mint_state: Account<'info, MintState>,
-    #[account(mut)]
+    #[account(mut, address = MINT_AUTHORITY)]
     pub authority: Signer<'info>,
     pub system_program: Program<'info, System>,
 }
@@ -502,6 +502,7 @@ pub struct FulfillMint<'info> {
     )]
     pub pending_mint: Box<Account<'info, PendingMint>>,
     /// CHECK: Geiger randomness request - verified via pending_mint
+    #[account(address = pending_mint.randomness_request, owner = GEIGER_PROGRAM)]
     pub randomness_request: UncheckedAccount<'info>,
     #[account(
         init,
@@ -597,7 +598,7 @@ pub struct CloseMintState<'info> {
         close = authority
     )]
     pub mint_state: Account<'info, MintState>,
-    #[account(mut)]
+    #[account(mut, address = mint_state.authority)]
     pub authority: Signer<'info>,
 }
 
