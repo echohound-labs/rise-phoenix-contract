@@ -2,9 +2,10 @@ use anchor_lang::prelude::*;
 use anchor_spl::associated_token::AssociatedToken;
 use anchor_spl::metadata::{
     create_master_edition_v3, create_metadata_accounts_v3,
+    mpl_token_metadata::accounts::Metadata as MetadataAccount,
     mpl_token_metadata::types::{CollectionDetails, Creator, DataV2},
-    set_and_verify_sized_collection_item, CreateMasterEditionV3, CreateMetadataAccountsV3, Metadata,
-    SetAndVerifySizedCollectionItem,
+    set_and_verify_sized_collection_item, update_metadata_accounts_v2, CreateMasterEditionV3,
+    CreateMetadataAccountsV3, Metadata, SetAndVerifySizedCollectionItem, UpdateMetadataAccountsV2,
 };
 use anchor_spl::token::{self, Mint, MintTo, Token, TokenAccount};
 
@@ -391,6 +392,92 @@ pub mod rise_phoenix_contract {
 
         Ok(())
     }
+
+    /// ── CERT: authority-gated royalty/creator update (ported from capy) ──
+    /// Rewrites only `seller_fee_basis_points` + the creators list; every other
+    /// field (name/symbol/uri/collection/uses) is copied forward unchanged, so
+    /// the verified collection membership is preserved.
+    ///
+    /// `verified` is never taken from args. A creator already verified on the
+    /// metadata keeps its flag; a new creator (e.g. the treasury) starts
+    /// unverified and must sign separately via Metaplex `SignMetadata`.
+    ///
+    /// The 80 members whose current verified creator is the `mint_state` PDA are
+    /// handled here: the PDA is also the update authority signing this CPI, and
+    /// Metaplex only protects *other* creators' verified flags, so dropping the
+    /// PDA creator is allowed.
+    pub fn update_royalty(
+        ctx: Context<UpdateRoyalty>,
+        seller_fee_basis_points: u16,
+        creators: Vec<CreatorArg>,
+    ) -> Result<()> {
+        require!(seller_fee_basis_points <= 10_000, PhoenixError::InvalidRoyalty);
+        require!(
+            !creators.is_empty() && creators.len() <= 5,
+            PhoenixError::InvalidCreators
+        );
+        let total: u32 = creators.iter().map(|c| c.share as u32).sum();
+        require!(total == 100, PhoenixError::InvalidCreators);
+
+        let bump = ctx.accounts.mint_state.bump;
+        let seeds = &[b"mint_state_v2".as_ref(), &[bump]];
+        let signer = &[&seeds[..]];
+
+        let cur = MetadataAccount::try_from(&ctx.accounts.metadata.to_account_info())?;
+        let trim = |s: &str| s.trim_end_matches('\0').to_string();
+
+        let existing = cur.creators.clone().unwrap_or_default();
+        let new_creators: Vec<Creator> = creators
+            .iter()
+            .map(|c| Creator {
+                address: c.address,
+                verified: existing.iter().any(|e| e.address == c.address && e.verified),
+                share: c.share,
+            })
+            .collect();
+
+        update_metadata_accounts_v2(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_metadata_program.to_account_info(),
+                UpdateMetadataAccountsV2 {
+                    metadata: ctx.accounts.metadata.to_account_info(),
+                    update_authority: ctx.accounts.mint_state.to_account_info(),
+                },
+                signer,
+            ),
+            None,
+            Some(DataV2 {
+                name: trim(&cur.name),
+                symbol: trim(&cur.symbol),
+                uri: trim(&cur.uri),
+                seller_fee_basis_points,
+                creators: Some(new_creators),
+                collection: cur.collection.clone(),
+                uses: cur.uses.clone(),
+            }),
+            None,
+            None,
+        )?;
+
+        Ok(())
+    }
+}
+
+#[derive(Accounts)]
+pub struct UpdateRoyalty<'info> {
+    #[account(seeds = [b"mint_state_v2"], bump = mint_state.bump, has_one = authority)]
+    pub mint_state: Account<'info, MintState>,
+    pub authority: Signer<'info>,
+    /// CHECK: metadata PDA, validated by the Metaplex CPI
+    #[account(mut)]
+    pub metadata: UncheckedAccount<'info>,
+    pub token_metadata_program: Program<'info, Metadata>,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub struct CreatorArg {
+    pub address: Pubkey,
+    pub share: u8,
 }
 
 #[derive(Accounts)]
@@ -621,4 +708,8 @@ pub enum PhoenixError {
     SoldOut,
     #[msg("Randomness not yet fulfilled by Geiger Oracle")]
     RandomnessNotReady,
+    #[msg("Royalty must be <= 10000 bps")]
+    InvalidRoyalty,
+    #[msg("Creators must be 1-5 entries with shares summing to 100")]
+    InvalidCreators,
 }
