@@ -1,395 +1,31 @@
 use anchor_lang::prelude::*;
-use anchor_spl::associated_token::AssociatedToken;
 use anchor_spl::metadata::{
-    create_master_edition_v3, create_metadata_accounts_v3,
     mpl_token_metadata::accounts::Metadata as MetadataAccount,
-    mpl_token_metadata::types::{CollectionDetails, Creator, DataV2},
-    set_and_verify_sized_collection_item, update_metadata_accounts_v2, CreateMasterEditionV3,
-    CreateMetadataAccountsV3, Metadata, SetAndVerifySizedCollectionItem, UpdateMetadataAccountsV2,
+    mpl_token_metadata::types::{Creator, DataV2},
+    update_metadata_accounts_v2, Metadata, UpdateMetadataAccountsV2,
 };
-use anchor_spl::token::{self, Mint, MintTo, Token, TokenAccount};
 
 declare_id!("5QUVVnm1duiRazqa69KW9ZQhCCZcg5GBUKkUn5avA8Gb");
 
-pub const MAX_SUPPLY: u32 = 500;
-pub const MINT_PRICE: u64 = 10_000_000_000;
-pub const ORACLE_FEE: u64 = 1_000_000_000; // 1 XNT to Geiger node
-
-pub const ORACLE_OPERATOR: Pubkey = pubkey!("HGFisVbULNKqogtPuGTfcHG9y6i5nboZabYwifkiiodo");
-pub const MINT_AUTHORITY: Pubkey = pubkey!("BAMEPccJucUMiVnsPJ2V9VzH5m3Q1TD9QDZJhrof4Nxy");
-pub const BASE_URI: &str = "https://rise-phoenix-nft.vercel.app/api/metadata/";
-pub const GEIGER_PROGRAM: Pubkey = pubkey!("BxUNg2yo5371BQMZPkfcxdCptFRDHkhvEXNM1QNPBRYU");
-// Parent RISE Phoenix Collection NFT — every mint auto-joins THIS collection (pinned).
-pub const COLLECTION_MINT: Pubkey = pubkey!("hzdZak4qN9bZ93ztu4bTBmDwx6F3XNyieFG5SQqCsJm");
+// FREEZE BUILD. The collection is sold out (500/500 in mint_state, every
+// member and the collection NFT has a max-supply-0 Master Edition). This build
+// keeps only what a finished collection needs:
+//   * close_pending_mint  - lets the three wallets with an abandoned
+//                           pending_mint on mainnet reclaim their rent
+//   * update_royalty      - unchanged
+//   * update_token_uri    - unchanged
+//   * lock_metadata       - one-way: sets is_mutable = false on a metadata
+//                           account whose update authority is mint_state
+// Removed for good (any call now fails with InstructionFallbackNotFound):
+// close_mint_state, initialize, request_mint, fulfill_mint, create_collection,
+// verify_collection, create_member_master_edition. Nothing in this program can
+// create mint_state, reset it, mint a token or create a collection any more.
 
 #[program]
 pub mod rise_phoenix_contract {
     use super::*;
 
     pub fn close_pending_mint(ctx: Context<ClosePendingMint>) -> Result<()> {
-        Ok(())
-    }
-
-    pub fn close_mint_state(ctx: Context<CloseMintState>) -> Result<()> {
-        Ok(())
-    }
-
-    pub fn initialize(ctx: Context<Initialize>) -> Result<()> {
-        let state = &mut ctx.accounts.mint_state;
-        state.total_minted = 0;
-        state.authority = ctx.accounts.authority.key();
-        state.bump = ctx.bumps.mint_state;
-        Ok(())
-    }
-
-    // Step 1: Request randomness from Geiger Oracle
-    pub fn request_mint(ctx: Context<RequestMint>) -> Result<()> {
-        require!(
-            ctx.accounts.mint_state.total_minted < MAX_SUPPLY,
-            PhoenixError::SoldOut
-        );
-
-        // Build user seed from minter pubkey + slot
-        let clock = Clock::get()?;
-        let mut user_seed = [0u8; 32];
-        user_seed[..32].copy_from_slice(&ctx.accounts.minter.key().to_bytes());
-        user_seed[0] ^= (clock.slot & 0xff) as u8;
-
-        // CPI to Geiger request_randomness
-        let request_ix = anchor_lang::solana_program::instruction::Instruction {
-            program_id: GEIGER_PROGRAM,
-            accounts: vec![
-                anchor_lang::solana_program::instruction::AccountMeta::new(ctx.accounts.oracle_state.key(), false),
-                anchor_lang::solana_program::instruction::AccountMeta::new_readonly(ctx.accounts.entropy_pool.key(), false),
-                anchor_lang::solana_program::instruction::AccountMeta::new(ctx.accounts.randomness_request.key(), false),
-                anchor_lang::solana_program::instruction::AccountMeta::new(ctx.accounts.minter.key(), true),
-                anchor_lang::solana_program::instruction::AccountMeta::new_readonly(ctx.accounts.system_program.key(), false),
-            ],
-            data: {
-                let mut d = vec![213, 5, 173, 166, 37, 236, 31, 18]; // request_randomness discriminator
-                d.extend_from_slice(&user_seed);
-                d
-            },
-        };
-
-        anchor_lang::solana_program::program::invoke(
-            &request_ix,
-            &[
-                ctx.accounts.oracle_state.to_account_info(),
-                ctx.accounts.entropy_pool.to_account_info(),
-                ctx.accounts.randomness_request.to_account_info(),
-                ctx.accounts.minter.to_account_info(),
-                ctx.accounts.system_program.to_account_info(),
-            ],
-        )?;
-
-        // Store pending mint info
-        let pending = &mut ctx.accounts.pending_mint;
-        pending.minter = ctx.accounts.minter.key();
-        pending.randomness_request = ctx.accounts.randomness_request.key();
-        pending.bump = ctx.bumps.pending_mint;
-        pending.slot_requested = clock.slot;
-
-        Ok(())
-    }
-
-    // Step 2: Fulfill mint after randomness is ready
-    pub fn fulfill_mint(ctx: Context<FulfillMint>) -> Result<()> {
-        let total_minted = ctx.accounts.mint_state.total_minted;
-        let bump = ctx.accounts.mint_state.bump;
-        require!(total_minted < MAX_SUPPLY, PhoenixError::SoldOut);
-
-        // Read random result from Geiger RandomnessRequest account
-        let request_data = ctx.accounts.randomness_request.try_borrow_data()?;
-        // Skip discriminator (8) + requester (32) + user_seed (32) = offset 72
-        let result = &request_data[72..104];
-        
-        // Check status is Fulfilled (offset 104, status byte should be 1)
-        require!(request_data[104] == 1, PhoenixError::RandomnessNotReady);
-
-        // Use random bytes to pick NFT number from full range (0-499)
-        let random_u32 = u32::from_le_bytes([result[0], result[1], result[2], result[3]]);
-        let mut candidate = (random_u32 % MAX_SUPPLY) as usize;
-        
-        // Find first unminted slot starting from random candidate
-        let mut mint_number = candidate as u32;
-        for _ in 0..MAX_SUPPLY {
-            let byte_idx = candidate / 64;
-            let bit_idx = candidate % 64;
-            let is_minted = (ctx.accounts.mint_state.minted_bitmap[byte_idx] & (1u64 << bit_idx)) != 0;
-            
-            if !is_minted {
-                mint_number = candidate as u32;
-                break;
-            }
-            candidate = (candidate + 1) % (MAX_SUPPLY as usize);
-        }
-        
-        // Mark this NFT as minted in bitmap
-        let byte_idx = mint_number as usize / 64;
-        let bit_idx = mint_number as usize % 64;
-        ctx.accounts.mint_state.minted_bitmap[byte_idx] |= 1u64 << bit_idx;
-
-        drop(request_data);
-
-        let seeds = &[b"mint_state_v2".as_ref(), &[bump]];
-        let signer_seeds = &[&seeds[..]];
-
-        // 1. Mint 1 token
-        token::mint_to(
-            CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(),
-                MintTo {
-                    mint: ctx.accounts.nft_mint.to_account_info(),
-                    to: ctx.accounts.minter_ata.to_account_info(),
-                    authority: ctx.accounts.mint_state.to_account_info(),
-                },
-                signer_seeds,
-            ),
-            1,
-        )?;
-
-        // 2. Create metadata
-        let uri = format!("{}{}", BASE_URI, mint_number);
-        let name = format!("RISE Phoenix #{}", mint_number);
-        let tier = if mint_number < 400 { "Ember" } else if mint_number < 475 { "Blaze" } else { "Genesis" };
-
-        create_metadata_accounts_v3(
-            CpiContext::new_with_signer(
-                ctx.accounts.token_metadata_program.to_account_info(),
-                CreateMetadataAccountsV3 {
-                    metadata: ctx.accounts.metadata.to_account_info(),
-                    mint: ctx.accounts.nft_mint.to_account_info(),
-                    mint_authority: ctx.accounts.mint_state.to_account_info(),
-                    payer: ctx.accounts.minter.to_account_info(),
-                    update_authority: ctx.accounts.mint_state.to_account_info(),
-                    system_program: ctx.accounts.system_program.to_account_info(),
-                    rent: ctx.accounts.rent.to_account_info(),
-                },
-                signer_seeds,
-            ),
-            DataV2 {
-                name,
-                symbol: "RISE".to_string(),
-                uri,
-                seller_fee_basis_points: 500,
-                creators: Some(vec![Creator {
-                    address: ctx.accounts.mint_state.key(),
-                    verified: true,
-                    share: 100,
-                }]),
-                collection: None,
-                uses: None,
-            },
-            true,
-            true,
-            None,
-        )?;
-
-        // 2b. Auto-join the collection: set + verify, program signs as mint_state
-        // (collection's update authority). Same proven CPI as verify_collection.
-        set_and_verify_sized_collection_item(
-            CpiContext::new_with_signer(
-                ctx.accounts.token_metadata_program.to_account_info(),
-                SetAndVerifySizedCollectionItem {
-                    metadata: ctx.accounts.metadata.to_account_info(),
-                    collection_authority: ctx.accounts.mint_state.to_account_info(),
-                    payer: ctx.accounts.minter.to_account_info(),
-                    update_authority: ctx.accounts.mint_state.to_account_info(),
-                    collection_mint: ctx.accounts.collection_mint.to_account_info(),
-                    collection_metadata: ctx.accounts.collection_metadata.to_account_info(),
-                    collection_master_edition: ctx
-                        .accounts
-                        .collection_master_edition
-                        .to_account_info(),
-                },
-                signer_seeds,
-            ),
-            None,
-        )?;
-
-        // Master Edition: hands mint authority to Metaplex, supply locked at 1
-        create_master_edition_v3(
-            CpiContext::new_with_signer(
-                ctx.accounts.token_metadata_program.to_account_info(),
-                CreateMasterEditionV3 {
-                    edition: ctx.accounts.master_edition.to_account_info(),
-                    mint: ctx.accounts.nft_mint.to_account_info(),
-                    update_authority: ctx.accounts.mint_state.to_account_info(),
-                    mint_authority: ctx.accounts.mint_state.to_account_info(),
-                    payer: ctx.accounts.minter.to_account_info(),
-                    metadata: ctx.accounts.metadata.to_account_info(),
-                    token_program: ctx.accounts.token_program.to_account_info(),
-                    system_program: ctx.accounts.system_program.to_account_info(),
-                    rent: ctx.accounts.rent.to_account_info(),
-                },
-                signer_seeds,
-            ),
-            Some(0),
-        )?;
-
-        // Transfer 1 XNT to Geiger Oracle operator
-        let oracle_ix = anchor_lang::solana_program::system_instruction::transfer(
-            &ctx.accounts.minter.key(),
-            &ORACLE_OPERATOR,
-            ORACLE_FEE,
-        );
-        anchor_lang::solana_program::program::invoke(
-            &oracle_ix,
-            &[
-                ctx.accounts.minter.to_account_info(),
-                ctx.accounts.oracle_operator.to_account_info(),
-                ctx.accounts.system_program.to_account_info(),
-            ],
-        )?;
-
-        // 4. Increment counter
-        ctx.accounts.mint_state.total_minted += 1;
-
-        emit!(MintEvent {
-            mint_number,
-            tier: tier.to_string(),
-            minter: ctx.accounts.minter.key(),
-        });
-
-        Ok(())
-    }
-
-    // ── CERT: give an already-minted member its Master Edition ──
-    // Moves mint authority from mint_state into the Master Edition PDA, so extra
-    // supply becomes impossible by construction. Authority-gated backfill.
-    pub fn create_member_master_edition(ctx: Context<CreateMemberMasterEdition>) -> Result<()> {
-        let bump = ctx.accounts.mint_state.bump;
-        let seeds = &[b"mint_state_v2".as_ref(), &[bump]];
-        let signer = &[&seeds[..]];
-
-        create_master_edition_v3(
-            CpiContext::new_with_signer(
-                ctx.accounts.token_metadata_program.to_account_info(),
-                CreateMasterEditionV3 {
-                    edition: ctx.accounts.master_edition.to_account_info(),
-                    mint: ctx.accounts.nft_mint.to_account_info(),
-                    update_authority: ctx.accounts.mint_state.to_account_info(),
-                    mint_authority: ctx.accounts.mint_state.to_account_info(),
-                    payer: ctx.accounts.authority.to_account_info(),
-                    metadata: ctx.accounts.metadata.to_account_info(),
-                    token_program: ctx.accounts.token_program.to_account_info(),
-                    system_program: ctx.accounts.system_program.to_account_info(),
-                    rent: ctx.accounts.rent.to_account_info(),
-                },
-                signer,
-            ),
-            Some(0),
-        )?;
-
-        Ok(())
-    }
-
-    // ── CERT: create the parent Collection NFT (sized), update authority = mint_state PDA ──
-    // Authority-gated. Run once. `uri` = hosted collection metadata JSON.
-    pub fn create_collection(ctx: Context<CreateCollection>, uri: String) -> Result<()> {
-        let bump = ctx.accounts.mint_state.bump;
-        let seeds = &[b"mint_state_v2".as_ref(), &[bump]];
-        let signer = &[&seeds[..]];
-
-        // 1 supply to the authority's collection ATA
-        token::mint_to(
-            CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(),
-                MintTo {
-                    mint: ctx.accounts.collection_mint.to_account_info(),
-                    to: ctx.accounts.collection_token.to_account_info(),
-                    authority: ctx.accounts.mint_state.to_account_info(),
-                },
-                signer,
-            ),
-            1,
-        )?;
-
-        // metadata, marked as a SIZED collection (size starts at 0)
-        create_metadata_accounts_v3(
-            CpiContext::new_with_signer(
-                ctx.accounts.token_metadata_program.to_account_info(),
-                CreateMetadataAccountsV3 {
-                    metadata: ctx.accounts.collection_metadata.to_account_info(),
-                    mint: ctx.accounts.collection_mint.to_account_info(),
-                    mint_authority: ctx.accounts.mint_state.to_account_info(),
-                    payer: ctx.accounts.authority.to_account_info(),
-                    update_authority: ctx.accounts.mint_state.to_account_info(),
-                    system_program: ctx.accounts.system_program.to_account_info(),
-                    rent: ctx.accounts.rent.to_account_info(),
-                },
-                signer,
-            ),
-            DataV2 {
-                name: "RISE Phoenix".to_string(),
-                symbol: "RISE".to_string(),
-                uri,
-                seller_fee_basis_points: 500,
-                creators: Some(vec![Creator {
-                    address: ctx.accounts.mint_state.key(),
-                    verified: true,
-                    share: 100,
-                }]),
-                collection: None,
-                uses: None,
-            },
-            true,
-            true,
-            Some(CollectionDetails::V1 { size: 0 }),
-        )?;
-
-        // master edition (max_supply 0 → a proper Collection NFT)
-        create_master_edition_v3(
-            CpiContext::new_with_signer(
-                ctx.accounts.token_metadata_program.to_account_info(),
-                CreateMasterEditionV3 {
-                    edition: ctx.accounts.collection_master_edition.to_account_info(),
-                    mint: ctx.accounts.collection_mint.to_account_info(),
-                    update_authority: ctx.accounts.mint_state.to_account_info(),
-                    mint_authority: ctx.accounts.mint_state.to_account_info(),
-                    payer: ctx.accounts.authority.to_account_info(),
-                    metadata: ctx.accounts.collection_metadata.to_account_info(),
-                    token_program: ctx.accounts.token_program.to_account_info(),
-                    system_program: ctx.accounts.system_program.to_account_info(),
-                    rent: ctx.accounts.rent.to_account_info(),
-                },
-                signer,
-            ),
-            Some(0),
-        )?;
-
-        Ok(())
-    }
-
-    // ── CERT: set + verify one already-minted member into the collection ──
-    // Members carry collection:None and update_authority = mint_state, so the
-    // program (signing as mint_state) does set_and_verify in one CPI. Authority-gated.
-    pub fn verify_collection(ctx: Context<VerifyCollectionItem>) -> Result<()> {
-        let bump = ctx.accounts.mint_state.bump;
-        let seeds = &[b"mint_state_v2".as_ref(), &[bump]];
-        let signer = &[&seeds[..]];
-
-        set_and_verify_sized_collection_item(
-            CpiContext::new_with_signer(
-                ctx.accounts.token_metadata_program.to_account_info(),
-                SetAndVerifySizedCollectionItem {
-                    metadata: ctx.accounts.metadata.to_account_info(),
-                    collection_authority: ctx.accounts.mint_state.to_account_info(),
-                    payer: ctx.accounts.authority.to_account_info(),
-                    update_authority: ctx.accounts.mint_state.to_account_info(),
-                    collection_mint: ctx.accounts.collection_mint.to_account_info(),
-                    collection_metadata: ctx.accounts.collection_metadata.to_account_info(),
-                    collection_master_edition: ctx
-                        .accounts
-                        .collection_master_edition
-                        .to_account_info(),
-                },
-                signer,
-            ),
-            None,
-        )?;
-
         Ok(())
     }
 
@@ -509,6 +145,37 @@ pub mod rise_phoenix_contract {
 
         Ok(())
     }
+
+    /// ── FREEZE: one-way metadata lock ──
+    /// Calls Metaplex UpdateMetadataAccountsV2 with data = None,
+    /// new_update_authority = None, primary_sale_happened = None and
+    /// is_mutable = Some(false). Metaplex then refuses any later data update
+    /// (update_token_uri, update_royalty) on this account, from anyone,
+    /// forever: is_mutable can only ever go from true to false.
+    /// Same gate as update_token_uri; works on members and the collection NFT.
+    /// Calling it on an already-locked account succeeds and changes nothing.
+    pub fn lock_metadata(ctx: Context<LockMetadata>) -> Result<()> {
+        let bump = ctx.accounts.mint_state.bump;
+        let seeds = &[b"mint_state_v2".as_ref(), &[bump]];
+        let signer = &[&seeds[..]];
+
+        update_metadata_accounts_v2(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_metadata_program.to_account_info(),
+                UpdateMetadataAccountsV2 {
+                    metadata: ctx.accounts.metadata.to_account_info(),
+                    update_authority: ctx.accounts.mint_state.to_account_info(),
+                },
+                signer,
+            ),
+            None,
+            None,
+            None,
+            Some(false),
+        )?;
+
+        Ok(())
+    }
 }
 
 #[derive(Accounts)]
@@ -540,154 +207,14 @@ pub struct CreatorArg {
 }
 
 #[derive(Accounts)]
-pub struct CreateCollection<'info> {
+pub struct LockMetadata<'info> {
     #[account(seeds = [b"mint_state_v2"], bump = mint_state.bump, has_one = authority)]
     pub mint_state: Account<'info, MintState>,
-    #[account(mut)]
     pub authority: Signer<'info>,
-    #[account(
-        init,
-        payer = authority,
-        mint::decimals = 0,
-        mint::authority = mint_state,
-        mint::freeze_authority = mint_state,
-    )]
-    pub collection_mint: Account<'info, Mint>,
-    #[account(
-        init,
-        payer = authority,
-        associated_token::mint = collection_mint,
-        associated_token::authority = authority,
-    )]
-    pub collection_token: Account<'info, TokenAccount>,
-    /// CHECK: Metaplex metadata PDA, created via CPI
-    #[account(mut)]
-    pub collection_metadata: UncheckedAccount<'info>,
-    /// CHECK: Metaplex master edition PDA, created via CPI
-    #[account(mut)]
-    pub collection_master_edition: UncheckedAccount<'info>,
-    pub token_program: Program<'info, Token>,
-    pub associated_token_program: Program<'info, AssociatedToken>,
-    pub token_metadata_program: Program<'info, Metadata>,
-    pub system_program: Program<'info, System>,
-    pub rent: Sysvar<'info, Rent>,
-}
-
-#[derive(Accounts)]
-pub struct VerifyCollectionItem<'info> {
-    #[account(seeds = [b"mint_state_v2"], bump = mint_state.bump, has_one = authority)]
-    pub mint_state: Account<'info, MintState>,
-    #[account(mut)]
-    pub authority: Signer<'info>,
-    /// CHECK: member NFT metadata, mutated by the CPI
+    /// CHECK: metadata PDA, validated by the Metaplex CPI
     #[account(mut)]
     pub metadata: UncheckedAccount<'info>,
-    /// CHECK: parent collection mint
-    pub collection_mint: UncheckedAccount<'info>,
-    /// CHECK: parent collection metadata, size-incremented by the CPI
-    #[account(mut)]
-    pub collection_metadata: UncheckedAccount<'info>,
-    /// CHECK: parent collection master edition
-    pub collection_master_edition: UncheckedAccount<'info>,
     pub token_metadata_program: Program<'info, Metadata>,
-}
-
-#[derive(Accounts)]
-pub struct Initialize<'info> {
-    #[account(
-        init,
-        payer = authority,
-        space = 8 + 4 + 32 + 1 + 64,  // Added 64 bytes for bitmap
-        seeds = [b"mint_state_v2"],
-        bump
-    )]
-    pub mint_state: Account<'info, MintState>,
-    #[account(mut, address = MINT_AUTHORITY)]
-    pub authority: Signer<'info>,
-    pub system_program: Program<'info, System>,
-}
-
-#[derive(Accounts)]
-pub struct RequestMint<'info> {
-    #[account(mut, seeds = [b"mint_state_v2"], bump = mint_state.bump)]
-    pub mint_state: Account<'info, MintState>,
-    #[account(mut)]
-    pub minter: Signer<'info>,
-    #[account(
-        init,
-        payer = minter,
-        space = 8 + 32 + 32 + 1 + 8,
-        seeds = [b"pending_mint", minter.key().as_ref()],
-        bump
-    )]
-    pub pending_mint: Account<'info, PendingMint>,
-    /// CHECK: Geiger oracle state PDA
-    #[account(mut)]
-    pub oracle_state: UncheckedAccount<'info>,
-    /// CHECK: Geiger entropy pool PDA
-    pub entropy_pool: UncheckedAccount<'info>,
-    /// CHECK: Geiger randomness request PDA (created by Geiger program)
-    #[account(mut)]
-    pub randomness_request: UncheckedAccount<'info>,
-    /// CHECK: Geiger program for CPI
-    pub geiger_program: UncheckedAccount<'info>,
-    pub system_program: Program<'info, System>,
-}
-
-#[derive(Accounts)]
-pub struct FulfillMint<'info> {
-    #[account(mut, seeds = [b"mint_state_v2"], bump = mint_state.bump)]
-    pub mint_state: Box<Account<'info, MintState>>,
-    #[account(mut)]
-    pub minter: Signer<'info>,
-    #[account(
-        mut,
-        seeds = [b"pending_mint", minter.key().as_ref()],
-        bump = pending_mint.bump,
-        close = minter
-    )]
-    pub pending_mint: Box<Account<'info, PendingMint>>,
-    /// CHECK: Geiger randomness request - verified via pending_mint
-    #[account(address = pending_mint.randomness_request, owner = GEIGER_PROGRAM)]
-    pub randomness_request: UncheckedAccount<'info>,
-    #[account(
-        init,
-        payer = minter,
-        mint::decimals = 0,
-        mint::authority = mint_state,
-        mint::freeze_authority = mint_state,
-    )]
-    pub nft_mint: Box<Account<'info, Mint>>,
-    #[account(
-        init,
-        payer = minter,
-        associated_token::mint = nft_mint,
-        associated_token::authority = minter,
-    )]
-    pub minter_ata: Box<Account<'info, TokenAccount>>,
-    /// CHECK: Metaplex metadata PDA
-    #[account(mut)]
-    pub metadata: UncheckedAccount<'info>,
-    /// CHECK: oracle operator wallet
-    #[account(mut, address = ORACLE_OPERATOR)]
-    pub oracle_operator: AccountInfo<'info>,
-    pub token_program: Program<'info, Token>,
-    pub associated_token_program: Program<'info, AssociatedToken>,
-    pub system_program: Program<'info, System>,
-    pub token_metadata_program: Program<'info, Metadata>,
-    pub rent: Sysvar<'info, Rent>,
-    // ── appended for auto-join (kept LAST so an un-upgraded program harmlessly ignores them) ──
-    /// CHECK: parent collection mint — pinned to the RISE collection
-    #[account(address = COLLECTION_MINT)]
-    pub collection_mint: UncheckedAccount<'info>,
-    /// CHECK: parent collection metadata, size-incremented by the CPI
-    #[account(mut)]
-    pub collection_metadata: UncheckedAccount<'info>,
-    /// CHECK: parent collection master edition
-    pub collection_master_edition: UncheckedAccount<'info>,
-    /// CHECK: member master edition PDA, created by the CPI
-    #[account(mut)]
-    pub master_edition: UncheckedAccount<'info>,
 }
 
 #[account]
@@ -704,48 +231,6 @@ pub struct PendingMint {
     pub randomness_request: Pubkey,
     pub bump: u8,
     pub slot_requested: u64,
-}
-
-#[event]
-pub struct MintEvent {
-    pub mint_number: u32,
-    pub tier: String,
-    pub minter: Pubkey,
-}
-
-
-#[derive(Accounts)]
-pub struct CreateMemberMasterEdition<'info> {
-    #[account(seeds = [b"mint_state_v2"], bump = mint_state.bump, has_one = authority)]
-    pub mint_state: Account<'info, MintState>,
-    #[account(mut)]
-    pub authority: Signer<'info>,
-    /// CHECK: member NFT metadata, read by the CPI
-    #[account(mut)]
-    pub metadata: UncheckedAccount<'info>,
-    /// CHECK: member NFT mint — authority moves into the master edition PDA
-    #[account(mut)]
-    pub nft_mint: UncheckedAccount<'info>,
-    /// CHECK: master edition PDA, created by the CPI
-    #[account(mut)]
-    pub master_edition: UncheckedAccount<'info>,
-    pub token_metadata_program: Program<'info, Metadata>,
-    pub token_program: Program<'info, Token>,
-    pub system_program: Program<'info, System>,
-    pub rent: Sysvar<'info, Rent>,
-}
-
-#[derive(Accounts)]
-pub struct CloseMintState<'info> {
-    #[account(
-        mut,
-        seeds = [b"mint_state_v2"],
-        bump = mint_state.bump,
-        close = authority
-    )]
-    pub mint_state: Account<'info, MintState>,
-    #[account(mut, address = mint_state.authority)]
-    pub authority: Signer<'info>,
 }
 
 #[derive(Accounts)]
