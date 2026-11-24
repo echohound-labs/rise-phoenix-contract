@@ -1,5 +1,5 @@
 // Offline checks for sweep_uri.cjs, lock_metadata.cjs, pin_metadata.cjs, update_royalty.cjs,
-// incinerate_collection.cjs and rise_meta_common.cjs. No network: RPC calls go to fake connection objects,
+// vault_collection.cjs and rise_meta_common.cjs. No network: RPC calls go to fake connection objects,
 // and refusal paths are exercised only where they exit before any network call.
 // Prereqs: `anchor build`, then `cd tests/svm && cargo test --offline` (writes the metadata dumps).
 // Run: node tests/scripts.offline.cjs
@@ -12,7 +12,7 @@ const sweep = require(path.join(repo, "sweep_uri.cjs"));
 const lockS = require(path.join(repo, "lock_metadata.cjs"));
 const pin = require(path.join(repo, "pin_metadata.cjs"));
 const roy = require(path.join(repo, "update_royalty.cjs"));
-const inc = require(path.join(repo, "incinerate_collection.cjs"));
+const vault = require(path.join(repo, "vault_collection.cjs"));
 const mainnetFx = path.join(repo, "tests/svm/fixtures/mainnet");
 const dumps = path.join(repo, "tests/svm/target/metadata-dumps");
 const idl = JSON.parse(fs.readFileSync(path.join(repo, "target/idl/rise_phoenix_contract.json")));
@@ -201,29 +201,42 @@ const fakeConn = (list) => ({ getProgramAccounts: async () => list, getAccountIn
   assert.ok(K.checkVerifyRecord(mp, ["members"], sh2).some((x) => /verified against map sha256/.test(x)), "map edited after verify");
   ok("map record: lock needs --map-sha256 == file == the sha256 a full --verify recorded, per scope");
 
-  // ── incinerate_collection.cjs ──
-  assert.strictEqual(inc.ata(inc.INCINERATOR).toBase58(), inc.EXPECTED_DEST);
-  assert.strictEqual(PublicKey.isOnCurve(inc.INCINERATOR.toBuffer()), false);
-  const holderPk = new PublicKey("BAMEPccJucUMiVnsPJ2V9VzH5m3Q1TD9QDZJhrof4Nxy"), src = inc.ata(holderPk);
+  // ── vault_collection.cjs (owner decision: ATA owned by the mint_state PDA, not the incinerator) ──
+  assert.strictEqual(vault.MINT_STATE.toBase58(), vault.EXPECTED_MINT_STATE);
+  assert.strictEqual(vault.MINT_STATE.toBase58(), ms.toBase58(), "same PDA as the scripts' mint_state");
+  assert.strictEqual(vault.ata(vault.MINT_STATE).toBase58(), vault.EXPECTED_DEST);
+  assert.strictEqual(vault.EXPECTED_DEST, "4HTVWQUUa5gb4QKyytfhyRNzKevAxzKHevrM2vfJM3KB");
+  assert.strictEqual(PublicKey.isOnCurve(vault.MINT_STATE.toBuffer()), false, "PDA: no key");
+  const INCIN = new PublicKey("1nc1nerator11111111111111111111111111111111"), SYS = new PublicKey("11111111111111111111111111111111");
+  assert.ok(!vault.MINT_STATE.equals(INCIN) && !vault.MINT_STATE.equals(SYS), "not an owner SPL Token lets anyone burn from");
+  assert.ok(!fs.readFileSync(path.join(repo, "vault_collection.cjs"), "utf8").includes("HQSNbZZ"), "old incinerator destination gone");
+  const holderPk = new PublicKey("BAMEPccJucUMiVnsPJ2V9VzH5m3Q1TD9QDZJhrof4Nxy"), src = vault.ata(holderPk);
   assert.strictEqual(src.toBase58(), "5aPXdprGkQ5pqbLoeh7tmvq2YU5itXW8inDCcGSs8fy2", "the holder ATA read from mainnet");
-  const [cr, tr] = inc.incinerateIxs(holderPk, src);
-  assert.deepStrictEqual([...cr.data], [1]); assert.strictEqual(cr.keys[1].pubkey.toBase58(), inc.EXPECTED_DEST); assert.strictEqual(cr.keys[2].pubkey.toBase58(), inc.INCINERATOR.toBase58());
+  const [cr, tr] = vault.vaultIxs(holderPk, src);
+  assert.deepStrictEqual([...cr.data], [1]); assert.strictEqual(cr.keys[1].pubkey.toBase58(), vault.EXPECTED_DEST); assert.strictEqual(cr.keys[2].pubkey.toBase58(), vault.EXPECTED_MINT_STATE);
+  assert.deepStrictEqual(cr.keys.map((k) => [k.isSigner, k.isWritable]), [[true, true], [false, true], [false, false], [false, false], [false, false], [false, false]]);
   assert.strictEqual(tr.data.toString("hex"), "0c" + "0100000000000000" + "00", "TransferChecked 1, decimals 0");
-  assert.deepStrictEqual(tr.keys.map((k) => [k.pubkey.toBase58(), k.isSigner, k.isWritable]), [[src.toBase58(), false, true], [K.COLLECTION_MINT, false, false], [inc.EXPECTED_DEST, false, true], [holderPk.toBase58(), true, false]]);
-  const ed = inc.editionPda().toBase58();
+  assert.deepStrictEqual(tr.keys.map((k) => [k.pubkey.toBase58(), k.isSigner, k.isWritable]), [[src.toBase58(), false, true], [K.COLLECTION_MINT, false, false], [vault.EXPECTED_DEST, false, true], [holderPk.toBase58(), true, false]]);
+  const ed = vault.editionPda().toBase58();
   assert.strictEqual(ed, "FjsB7uDCVswotg71cw1hUuuhncyS3gsaY6sDDsTgwrkm");
   const st = (o = {}) => ({ mint: { supply: 1n, decimals: 0, mintAuthority: ed, freezeAuthority: ed }, holders: [{ address: src.toBase58(), info: { owner: holderPk.toBase58(), amount: 1n, state: 1, delegate: null } }],
     collection: { ...collM({}), isMutable: false }, lockedMembers: 500, holder: holderPk.toBase58(), ...o });
-  assert.deepStrictEqual(inc.gate(st()), []);
-  assert.ok(inc.gate(st({ collection: collM({}) })).some((x) => /not LOCKED/.test(x)));
-  assert.ok(inc.gate(st({ lockedMembers: 499 })).some((x) => /499\/500/.test(x)));
-  assert.ok(inc.gate(st({ holder: Keypair.generate().publicKey.toBase58() })).some((x) => /holder keypair/.test(x)));
-  assert.ok(inc.gate(st({ holders: [{ address: src.toBase58(), info: { owner: holderPk.toBase58(), amount: 1n, state: 2, delegate: null } }] })).some((x) => /frozen/.test(x)));
-  assert.ok(inc.gate(st({ holders: [{ address: inc.EXPECTED_DEST, info: { owner: inc.INCINERATOR.toBase58(), amount: 1n, state: 1, delegate: null } }] })).some((x) => /already/.test(x)));
-  assert.ok(inc.gate(st({ mint: { supply: 1n, decimals: 0, mintAuthority: holderPk.toBase58(), freezeAuthority: ed } })).some((x) => /mint authority/.test(x)));
-  assert.deepStrictEqual(inc.checkIncinerated({ mint: K.COLLECTION_MINT, owner: inc.INCINERATOR.toBase58(), amount: 1n, delegate: null, closeAuthority: null, state: 1 }, { amount: 0n }), []);
-  assert.ok(inc.checkIncinerated(null, null).length === 1);
-  ok("incinerate_collection.cjs: destination HQSNbZZ… = ATA(off-curve incinerator), CreateIdempotent + TransferChecked(1), gates, post-check");
+  assert.deepStrictEqual(vault.gate(st()), []);
+  assert.ok(vault.gate(st({ collection: collM({}) })).some((x) => /not LOCKED/.test(x)));
+  assert.ok(vault.gate(st({ collection: { ...collM({ fee: 500 }), isMutable: false } })).some((x) => /royalty/.test(x)));
+  assert.ok(vault.gate(st({ lockedMembers: 499 })).some((x) => /499\/500/.test(x)));
+  assert.ok(vault.gate(st({ holder: Keypair.generate().publicKey.toBase58() })).some((x) => /holder keypair/.test(x)));
+  assert.ok(vault.gate(st({ holders: [{ address: src.toBase58(), info: { owner: holderPk.toBase58(), amount: 1n, state: 2, delegate: null } }] })).some((x) => /frozen/.test(x)));
+  assert.ok(vault.gate(st({ holders: [{ address: src.toBase58(), info: { owner: holderPk.toBase58(), amount: 1n, state: 1, delegate: stranger } }] })).some((x) => /delegate/.test(x)));
+  assert.ok(vault.gate(st({ holders: [{ address: vault.EXPECTED_DEST, info: { owner: vault.EXPECTED_MINT_STATE, amount: 1n, state: 1, delegate: null } }] })).some((x) => /already in the vault/.test(x)));
+  assert.ok(vault.gate(st({ holders: [] })).some((x) => /0 token accounts/.test(x)));
+  assert.ok(vault.gate(st({ mint: { supply: 1n, decimals: 0, mintAuthority: holderPk.toBase58(), freezeAuthority: ed } })).some((x) => /mint authority/.test(x)));
+  const vgood = { mint: K.COLLECTION_MINT, owner: vault.EXPECTED_MINT_STATE, amount: 1n, delegate: null, closeAuthority: null, state: 1 };
+  assert.deepStrictEqual(vault.checkVaulted(vgood, { amount: 0n }), []);
+  assert.ok(vault.checkVaulted({ ...vgood, owner: INCIN.toBase58() }, { amount: 0n }).some((x) => /owner/.test(x)), "incinerator-owned refused");
+  assert.ok(vault.checkVaulted(vgood, { amount: 1n }).some((x) => /source/.test(x)));
+  assert.ok(vault.checkVaulted(null, null).length === 1);
+  ok("vault_collection.cjs: destination 4HTVWQUU… = ATA(mint_state PDA) pinned, CreateIdempotent + TransferChecked(1), gates, post-check");
 
   // ── CIDv0 (cross-checked with `ipfs add -n -q --cid-version 0`) ──
   // external_url = https://x1forge.xyz/collection/rise (rise-phoenix-nft branch feat/external-url-x1forge)
@@ -278,13 +291,14 @@ const fakeConn = (list) => ({ getProgramAccounts: async () => list, getAccountIn
   refuse("update_royalty.cjs", ["--cluster", "testnet"], /unknown argument/);
   refuse("update_royalty.cjs", ["--collection", "--token", "1"], /exclusive/);
   refuse("update_royalty.cjs", ["--creator", "Gowv5PDb7K4a5PwjubWegvBT4CDfjjJcG4QAZWa9yUob"], /unknown argument/);
-  refuse("incinerate_collection.cjs", ["--send"], /confirm-mainnet/);
-  refuse("incinerate_collection.cjs", ["--verify", "--send", "--confirm-mainnet"], /read-only/);
-  refuse("incinerate_collection.cjs", ["--dest", "x"], /unknown argument/);
+  refuse("vault_collection.cjs", ["--send"], /confirm-mainnet/);
+  refuse("vault_collection.cjs", ["--verify", "--send", "--confirm-mainnet"], /read-only/);
+  refuse("vault_collection.cjs", ["--dest", "x"], /unknown argument/);
+  refuse("vault_collection.cjs", ["--program", "5QUVVnm1duiRazqa69KW9ZQhCCZcg5GBUKkUn5avA8Gb"], /unknown argument/);
   refuse("readonly_checks.cjs", ["update-sim"], /exactly one/);
   refuse("readonly_checks.cjs", ["send"], /editions or update-sim/);
-  ok("refusal paths: 35 bad invocations exit 1 before any network call (incl. L1, L3, M4)");
-  for (const f of ["sweep_uri.cjs", "lock_metadata.cjs", "pin_metadata.cjs", "rise_meta_common.cjs", "update_royalty.cjs", "incinerate_collection.cjs", "readonly_checks.cjs"]) assert.strictEqual(spawnSync(process.execPath, ["--check", path.join(repo, f)]).status, 0);
+  ok("refusal paths: 36 bad invocations exit 1 before any network call (incl. L1, L3, M4)");
+  for (const f of ["sweep_uri.cjs", "lock_metadata.cjs", "pin_metadata.cjs", "rise_meta_common.cjs", "update_royalty.cjs", "vault_collection.cjs", "readonly_checks.cjs"]) assert.strictEqual(spawnSync(process.execPath, ["--check", path.join(repo, f)]).status, 0);
   ok("node --check on all seven scripts");
   fs.rmSync(tmp, { recursive: true, force: true });
   console.log(`\nALL ${n} OFFLINE CHECK GROUPS PASSED`);

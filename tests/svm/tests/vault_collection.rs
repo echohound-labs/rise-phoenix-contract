@@ -1,13 +1,15 @@
-//! Owner decision 4 (audit M3): after the lock, the collection NFT token goes to
-//! the incinerator's ATA. These tests show what that does and does not prevent,
-//! with the same two instructions incinerate_collection.cjs sends
-//! (ATA CreateIdempotent + SPL TransferChecked of 1).
+//! Owner decision (2026-11-24, follow-up 2): after the lock, the collection NFT token
+//! goes into the "vault", the ATA owned by the mint_state PDA, with the same two
+//! instructions vault_collection.cjs sends (ATA CreateIdempotent + SPL TransferChecked of 1).
 //!
-//! Control first: while a wallet holds the token it can burn the collection NFT
-//! (audit probe D). After the move, the former holder, a stranger and the
-//! freeze authority path all fail; only a signature by the incinerator itself
-//! would work (shown with sigverify off), and no such signature can exist: the
-//! address is off the ed25519 curve.
+//! Control first: while a wallet holds the token it can BurnNft the collection NFT and
+//! wipe its metadata (audit probe D). After the move into the vault, the former holder,
+//! a stranger and every instruction of the freeze program fail to burn, transfer,
+//! delegate or close it, on LiteSVM's Token program AND X1 mainnet's Token binary.
+//!
+//! Kept as the record of why the destination changed: with the incinerator's ATA, an
+//! SPL Burn by ANYONE succeeds (SPL Token skips the owner check for accounts owned by
+//! the incinerator or the system program).
 
 mod common;
 use common::*;
@@ -89,12 +91,24 @@ fn token_amount(env: &Env, acc: &Pubkey) -> Option<u64> {
 }
 
 #[test]
+fn vault_address_is_pinned_and_off_curve() {
+    let ms = mint_state_pda().0;
+    assert_eq!(ms, pubkey!("7m8h2Rf5w4UzPqS9EVMVkHwaKhhfvrJiwoc8Qvapkxoh"));
+    assert!(!ms.is_on_curve(), "a PDA: no secret key exists");
+    assert_eq!(
+        ata(&ms, &pubkey!("hzdZak4qN9bZ93ztu4bTBmDwx6F3XNyieFG5SQqCsJm")),
+        pubkey!("4HTVWQUUa5gb4QKyytfhyRNzKevAxzKHevrM2vfJM3KB"),
+        "the destination vault_collection.cjs pins"
+    );
+}
+
+#[test]
 fn incinerator_is_off_curve() {
     assert!(!INCINERATOR.is_on_curve(), "no ed25519 secret key exists for it");
     assert_eq!(
         ata(&INCINERATOR, &pubkey!("hzdZak4qN9bZ93ztu4bTBmDwx6F3XNyieFG5SQqCsJm")),
         pubkey!("HQSNbZZMNuJhQTXsWAZimfiT4PLyyAD5VM2zR23LZfpE"),
-        "the destination incinerate_collection.cjs uses"
+        "the destination follow-up 1 used (no longer used)"
     );
 }
 
@@ -149,7 +163,7 @@ fn mint_supply(env: &Env, mint: &Pubkey) -> u64 {
 }
 
 #[test]
-fn after_the_move_nobody_can_transfer_delegate_close_or_metaplex_burn() {
+fn incinerator_ata_blocks_transfer_delegate_close_and_burnnft() {
     for tv in token_variants() {
         let (mut env, auth, coll, _source, dest) = moved(&tv);
         let md_before = env.raw_md(&coll);
@@ -216,13 +230,13 @@ fn finding_anyone_can_spl_burn_a_token_held_by_the_incinerator() {
     }
 }
 
-/// Alternative for the owner (not what the script does): an ATA owned by the mint_state PDA.
-/// mint_state is neither the incinerator nor the system program, so SPL's permissionless burn
-/// does not apply, and no key exists for a PDA. The freeze build has no token-program CPI at all
-/// (it only CPIs Metaplex UpdateMetadataAccountsV2), so mint_state can never sign a transfer or
-/// burn; once the upgrade authority is renounced that is permanent. Both token binaries.
+/// THE SCRIPT'S PATH: the ATA owned by the mint_state PDA. mint_state is neither the
+/// incinerator nor the system program, so SPL's permissionless burn does not apply, and no key
+/// exists for a PDA. The freeze build has no token-program CPI at all (it only CPIs Metaplex
+/// UpdateMetadataAccountsV2), so mint_state can never sign a transfer or burn; once the upgrade
+/// authority is renounced that is permanent. Both token binaries.
 #[test]
-fn alternative_mint_state_owned_ata_resists_burn_and_transfer() {
+fn vault_mint_state_owned_ata_resists_burn_and_transfer() {
     for tv in token_variants() {
         let mut env = setup();
         if let Some(so) = &tv {
@@ -249,4 +263,54 @@ fn alternative_mint_state_owned_ata_resists_burn_and_transfer() {
         assert_eq!(env.svm.get_account(&dest).unwrap(), before);
         assert_eq!(mint_supply(&env, &coll), 1);
     }
+}
+
+/// Every instruction of the freeze program, with the vault ATA where its writable account goes,
+/// signed by the real authority: all fail and the vault is byte-identical. (The program has no
+/// token CPI; its Metaplex CPI is refused because the vault is not a metadata account.)
+#[test]
+fn freeze_program_instructions_cannot_touch_the_vault() {
+    let mut env = setup();
+    let auth = env.authority.insecure_clone();
+    let coll = env.collection_mint;
+    let ms = env.mint_state;
+    let source = ata(&auth.pubkey(), &coll);
+    let vault = ata(&ms, &coll);
+    env.send(&[create_idempotent_ix(auth.pubkey(), ms, coll), transfer_checked_ix(source, coll, vault, auth.pubkey())], &[&auth])
+        .expect("move to the vault");
+    let before = env.svm.get_account(&vault).unwrap();
+    let with_vault = |data: Vec<u8>| Instruction {
+        program_id: PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new_readonly(ms, false),
+            AccountMeta::new_readonly(auth.pubkey(), true),
+            AccountMeta::new(vault, false),
+            AccountMeta::new_readonly(MPL, false),
+        ],
+        data,
+    };
+    let mut uri = disc("global", "update_token_uri").to_vec();
+    borsh_str(&mut uri, NEW_URI);
+    let mut roy = disc("global", "update_royalty").to_vec();
+    roy.extend_from_slice(&300u16.to_le_bytes());
+    roy.extend_from_slice(&1u32.to_le_bytes());
+    roy.extend_from_slice(auth.pubkey().as_ref());
+    roy.push(100);
+    for (what, ix) in [
+        ("lock_metadata", with_vault(disc("global", "lock_metadata").to_vec())),
+        ("update_token_uri", with_vault(uri)),
+        ("update_royalty", with_vault(roy)),
+        (
+            "close_pending_mint",
+            Instruction {
+                program_id: PROGRAM_ID,
+                accounts: vec![AccountMeta::new(vault, false), AccountMeta::new(auth.pubkey(), true)],
+                data: disc("global", "close_pending_mint").to_vec(),
+            },
+        ),
+    ] {
+        assert!(env.send(&[ix], &[&auth]).is_err(), "{what} with the vault must fail");
+        assert_eq!(env.svm.get_account(&vault).unwrap(), before, "{what}: vault unchanged");
+    }
+    assert_eq!(token_amount(&env, &vault), Some(1));
 }
