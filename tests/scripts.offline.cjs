@@ -281,9 +281,11 @@ const fakeConn = (list) => ({ getProgramAccounts: async () => list, getAccountIn
   refuse("incinerate_collection.cjs", ["--send"], /confirm-mainnet/);
   refuse("incinerate_collection.cjs", ["--verify", "--send", "--confirm-mainnet"], /read-only/);
   refuse("incinerate_collection.cjs", ["--dest", "x"], /unknown argument/);
-  ok("refusal paths: 33 bad invocations exit 1 before any network call (incl. L1, L3, M4)");
-  for (const f of ["sweep_uri.cjs", "lock_metadata.cjs", "pin_metadata.cjs", "rise_meta_common.cjs", "update_royalty.cjs", "incinerate_collection.cjs"]) assert.strictEqual(spawnSync(process.execPath, ["--check", path.join(repo, f)]).status, 0);
-  ok("node --check on all six scripts");
+  refuse("readonly_checks.cjs", ["update-sim"], /exactly one/);
+  refuse("readonly_checks.cjs", ["send"], /editions or update-sim/);
+  ok("refusal paths: 35 bad invocations exit 1 before any network call (incl. L1, L3, M4)");
+  for (const f of ["sweep_uri.cjs", "lock_metadata.cjs", "pin_metadata.cjs", "rise_meta_common.cjs", "update_royalty.cjs", "incinerate_collection.cjs", "readonly_checks.cjs"]) assert.strictEqual(spawnSync(process.execPath, ["--check", path.join(repo, f)]).status, 0);
+  ok("node --check on all seven scripts");
   fs.rmSync(tmp, { recursive: true, force: true });
   console.log(`\nALL ${n} OFFLINE CHECK GROUPS PASSED`);
 })().catch((e) => { console.error("FAILED:", e); process.exit(1); });
