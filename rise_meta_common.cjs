@@ -9,6 +9,7 @@
 //   = uri_map.json key "N"
 
 const { PublicKey } = require("@solana/web3.js");
+const crypto = require("crypto"), fs = require("fs");
 
 const DEFAULT_RPC = "https://rpc.mainnet.x1.xyz";
 const DEFAULT_PROGRAM = "5QUVVnm1duiRazqa69KW9ZQhCCZcg5GBUKkUn5avA8Gb";
@@ -23,6 +24,18 @@ const COLLECTION_MINT = "hzdZak4qN9bZ93ztu4bTBmDwx6F3XNyieFG5SQqCsJm";
 const COLLECTION_METADATA = "FRN2yo3JLHV3ZXqcwsAgxRcDu2YFTQjvjT4cg35J6inR";
 const COLLECTION_KEY = "collection"; // uri_map.json key for the collection NFT
 const COLLECTION_OLD_URI = OLD_BASE + "0";
+
+// ── Final state, owner decisions 2026-11-24 (final) ─────────────────────
+// Royalty for ALL 500 members AND the collection NFT: 300 bps, single creator
+// GZuB… (share 100, VERIFIED). lock_metadata.cjs locks nothing that is not at it.
+const FINAL_BPS = 300;
+const FINAL_CREATOR = "GZuBHE3fQCQ6eSTLMwWKrK15CjtWfA58BmxdtWwG5mJJ"; // ~/.config/solana/capy-lp-treasury.json
+// The 217 members' current verified creator. Metaplex refuses to drop a verified
+// creator other than the update authority (55), so it must un-verify itself first.
+const OLD_TREASURY = "Gowv5PDb7K4a5PwjubWegvBT4CDfjjJcG4QAZWa9yUob"; // ~/.config/solana/rise-treasury.json
+// external_url in every member JSON and the collection JSON: x1forge's RISE collection page
+// (echomarket-frontend app/collection/[slug], registry slug "rise" = gate mint_state 7m8h2…).
+const EXTERNAL_URL = "https://x1forge.xyz/collection/rise";
 
 const mdPda = (mint) =>
   PublicKey.findProgramAddressSync([Buffer.from("metadata"), MPL.toBuffer(), new PublicKey(mint).toBuffer()], MPL)[0];
@@ -141,6 +154,62 @@ async function readBack(c, pda, landed, same, { tries = 6, delayMs = 1500 } = {}
   return { ok: false, after: last, tries, notLanded: true };
 }
 
+// ── Royalty (final state + what a token still needs) ───────────────────
+const royaltyIsFinal = (m) =>
+  m.fee === FINAL_BPS && Array.isArray(m.creators) && m.creators.length === 1 &&
+  m.creators[0].address === FINAL_CREATOR && m.creators[0].share === 100 && m.creators[0].verified === true;
+
+// One transaction per token: [RemoveCreatorVerification(x) for x in unverify] → update_royalty → SignMetadata(GZuB).
+//   unverify: verified creators that are neither GZuB nor mint_state (mint_state is the update
+//             authority signing the CPI, so Metaplex lets the update drop it). Only Gowv5 can be
+//             handled (its keypair); any other verified creator blocks the token.
+//   update:   bps or creator list differ from [GZuB:100].
+//   sign:     GZuB is not verified after the update (a new creator always starts unverified;
+//             an already-verified GZuB keeps its flag through update_royalty).
+function royaltyPlan(m, mintState) {
+  const c = m.creators || [];
+  if (royaltyIsFinal(m)) return { done: true, unverify: [], update: false, sign: false, blocked: null };
+  const listOk = c.length === 1 && c[0].address === FINAL_CREATOR && c[0].share === 100;
+  const update = m.fee !== FINAL_BPS || !listOk;
+  const unverify = update ? c.filter((x) => x.verified && x.address !== FINAL_CREATOR && x.address !== mintState).map((x) => x.address) : [];
+  const gzubVerified = c.some((x) => x.address === FINAL_CREATOR && x.verified);
+  const sign = !gzubVerified;
+  let blocked = null;
+  if (!m.isMutable) blocked = "locked (is_mutable false) and not at the final royalty: can never be fixed";
+  else if (unverify.some((a) => a !== OLD_TREASURY)) blocked = `verified creator(s) ${unverify.filter((a) => a !== OLD_TREASURY).join(",")} would have to un-verify themselves; no keypair for them`;
+  return { done: false, unverify, update, sign, blocked };
+}
+
+// ── Map sha256 record (audit L3) ────────────────────────────────────────
+// sweep_uri.cjs --verify writes <map>.verified.json after a FULL, passing verify
+// (all 500 members with the Vercel compare, or the collection). lock_metadata.cjs
+// refuses unless the map file still hashes to what was verified AND to the
+// --map-sha256 the owner passes by hand.
+const sha256Hex = (buf) => crypto.createHash("sha256").update(buf).digest("hex");
+const sha256File = (p) => sha256Hex(fs.readFileSync(p));
+const recordPath = (mapPath) => mapPath + ".verified.json";
+function writeVerifyRecord(mapPath, scope, info) {
+  const rp = recordPath(mapPath);
+  const rec = fs.existsSync(rp) ? JSON.parse(fs.readFileSync(rp, "utf8")) : {};
+  rec[scope] = { map_sha256: sha256File(mapPath), verified_at: new Date().toISOString(), ...info };
+  fs.writeFileSync(rp, JSON.stringify(rec, null, 2) + "\n");
+  return rec[scope];
+}
+// Problems that stop a lock. scopes ⊆ ["members", "collection"].
+function checkVerifyRecord(mapPath, scopes, wantSha) {
+  const p = [];
+  const have = sha256File(mapPath);
+  if (!/^[0-9a-f]{64}$/.test(wantSha || "")) p.push("--map-sha256 must be the 64-hex sha256 recorded after step 8 (sha256sum uri_map.json)");
+  else if (have !== wantSha) p.push(`map file sha256 is ${have}, --map-sha256 says ${wantSha}: the map changed since it was recorded`);
+  const rp = recordPath(mapPath);
+  const rec = fs.existsSync(rp) ? JSON.parse(fs.readFileSync(rp, "utf8")) : {};
+  for (const s of scopes) {
+    if (!rec[s]) p.push(`no passing sweep_uri.cjs --verify recorded for ${s} in ${rp}`);
+    else if (rec[s].map_sha256 !== have) p.push(`${s} was verified against map sha256 ${rec[s].map_sha256}, the map is now ${have}: run --verify again`);
+  }
+  return p;
+}
+
 // ── uri map ─────────────────────────────────────────────────────────────
 // {"0": uri, ..., "499": uri, "collection": uri}. Keys "collection" optional.
 function checkMap(raw) {
@@ -176,5 +245,7 @@ function jsonDiff(a, b, path = "") {
 module.exports = {
   DEFAULT_RPC, DEFAULT_PROGRAM, MPL, OLD_BASE, OLD_HOST, MAX_URI_LENGTH, EXPECTED_MEMBERS,
   COLLECTION_MINT, COLLECTION_METADATA, COLLECTION_KEY, COLLECTION_OLD_URI,
+  FINAL_BPS, FINAL_CREATOR, OLD_TREASURY, EXTERNAL_URL, royaltyIsFinal, royaltyPlan,
+  sha256Hex, sha256File, recordPath, writeVerifyRecord, checkVerifyRecord,
   mdPda, mintStatePda, parseArgs, V, parseMetadata, num, fingerprint, isMember, discover, readBack, checkMap, jsonDiff,
 };

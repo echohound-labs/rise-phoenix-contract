@@ -1,196 +1,227 @@
-// Set royalty + creators on all RISE Phoenix NFTs via the program's
-// authority-gated `update_royalty`, then verify the creator with Metaplex
-// SignMetadata. Ported from cappy-nft-mint's update_royalty.cjs.
+// Set the FINAL royalty on every RISE Phoenix member and on the collection NFT:
+// 300 bps, single creator GZuBHE3f… (share 100, VERIFIED). Owner decision 2026-11-24.
 //
-//   node update_royalty.cjs                          dry-run, mainnet, all members
-//   node update_royalty.cjs --cluster testnet        dry-run against testnet
-//   node update_royalty.cjs --mint <MINT>            single NFT
-//   node update_royalty.cjs --send                   actually send (testnet)
-//   node update_royalty.cjs --send --confirm-mainnet actually send (mainnet)
+//   node update_royalty.cjs                                  dry-run: 500 members (simulates one tx per group)
+//   node update_royalty.cjs --token 1                        dry-run, one member
+//   node update_royalty.cjs --collection                     dry-run, the collection NFT FRN2yo3…
+//   node update_royalty.cjs --token 1 --send --confirm-mainnet       PILOT
+//   node update_royalty.cjs --send --confirm-mainnet                 all members still to do
+//   node update_royalty.cjs --collection --send --confirm-mainnet    the collection NFT
 //
-// Other flags: --limit N, --program <ID>, --creator <PUBKEY>,
-//              --authority-keypair <path>, --creator-keypair <path>
+// Options: --rpc <url>, --program <id>, --limit <n>, --priority <µLamports/CU>,
+//          --authority-keypair <path>   mint_state.authority BAMEPcc… (default ~/.config/solana/rise-mint-authority.json)
+//          --creator-keypair <path>     GZuB…, signs SignMetadata  (default ~/.config/solana/capy-lp-treasury.json)
+//          --old-treasury-keypair <path> Gowv5…, signs RemoveCreatorVerification for the 217
+//                                       (default ~/.config/solana/rise-treasury.json)
 //
-// Dry-run is the default and never reads a keypair file. NFTs already at the
-// target state are skipped, so reruns only touch what is left.
+// What each token needs (Metaplex rules, proven in tests/svm/tests/royalty_final.rs on
+// X1 mainnet's own Token Metadata binary and mainnet bytes):
+//   217 at [Gowv5:100 ✓] @ 100 bps     RemoveCreatorVerification(Gowv5) + update_royalty + SignMetadata(GZuB)
+//                                       (without the un-verify Metaplex refuses with 55)
+//   283 at [mint_state:100 ✓] @ 500    update_royalty + SignMetadata(GZuB)
+//   collection, same as the 283        update_royalty + SignMetadata(GZuB)
+// All steps of one token are ONE transaction, so a token is never left half-done.
 //
-// The 217 minted members are currently in three states, all converging to the
-// target [treasury:100 verified] @ 100bps:
-//   80  mint_state PDA  as VERIFIED creator   (dropped; PDA == update authority)
-//   75  BAMEPcc wallet  as unverified creator (replaced)
-//   62  treasury Gowv…  as unverified creator (kept, then verified)
-// The parent collection NFT (no "#N" in its name) is intentionally left alone.
+// Safety (audit M4):
+//   * Members = the shared discovery (K.discover): update authority mint_state AND
+//     verified collection hzdZak4… AND name "RISE Phoenix #N", exactly 500, numbered 0..499,
+//     each at its mint's metadata PDA. A spoof can never be signed by the treasury keys.
+//   * Strict arguments (unknown, repeated, malformed or valueless options refuse).
+//   * Dry-run is the default and never opens a keypair. --send needs --confirm-mainnet.
+//     Keypairs are read from files only, and each must be the expected public key.
+//   * Any token that cannot reach the target (locked, or another verified creator) blocks the run.
+//   * After each send the account is read back with retries: royalty must be final and every
+//     other field (including raw trailing bytes) unchanged. Else exit 2.
+//   * Re-runs skip tokens already final.
+
 const { Connection, PublicKey, Keypair, Transaction, TransactionInstruction, ComputeBudgetProgram, sendAndConfirmTransaction } = require("@solana/web3.js");
 const crypto = require("crypto"), fs = require("fs");
+const K = require("./rise_meta_common.cjs");
 
-const CLUSTERS = {
-  mainnet: { rpc: "https://rpc.mainnet.x1.xyz", program: "5QUVVnm1duiRazqa69KW9ZQhCCZcg5GBUKkUn5avA8Gb" },
-  testnet: { rpc: "https://rpc.testnet.x1.xyz", program: "5QUVVnm1duiRazqa69KW9ZQhCCZcg5GBUKkUn5avA8Gb" },
+const HOME = process.env.HOME;
+const DEFAULT_KP = {
+  authority: HOME + "/.config/solana/rise-mint-authority.json",
+  creator: HOME + "/.config/solana/capy-lp-treasury.json",
+  oldTreasury: HOME + "/.config/solana/rise-treasury.json",
 };
-const MPL = new PublicKey("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s");
+const DISC = crypto.createHash("sha256").update("global:update_royalty").digest().slice(0, 8);
 
-// ── Target state ───────────────────────────────────────────────────────
-const TARGET_BPS = 100; // 1%
-const DEFAULT_CREATOR = "Gowv5PDb7K4a5PwjubWegvBT4CDfjjJcG4QAZWa9yUob"; // rise-treasury
-
-// ── Args ───────────────────────────────────────────────────────────────
-const argv = process.argv.slice(2);
-const flag = (n) => argv.includes(n);
-const opt = (n, d) => { const i = argv.indexOf(n); return i >= 0 ? argv[i + 1] : d; };
-const SEND = flag("--send");
-const clusterName = opt("--cluster", "mainnet");
-const cluster = CLUSTERS[clusterName];
-if (!cluster) { console.error("unknown --cluster", clusterName); process.exit(1); }
-const PROGRAM = new PublicKey(opt("--program", cluster.program));
-const CREATOR = new PublicKey(opt("--creator", DEFAULT_CREATOR));
-const ONLY_MINT = opt("--mint", null);
-const LIMIT = +opt("--limit", 0);
-const AUTH_KP = opt("--authority-keypair", process.env.HOME + "/.config/solana/rise-mint-authority.json");
-const CREATOR_KP = opt("--creator-keypair", process.env.HOME + "/.config/solana/rise-treasury.json");
-const CONCURRENCY = 4;
-
-const [MINT_STATE] = PublicKey.findProgramAddressSync([Buffer.from("mint_state_v2")], PROGRAM);
-const mdPda = (mint) => PublicKey.findProgramAddressSync([Buffer.from("metadata"), MPL.toBuffer(), mint.toBuffer()], MPL)[0];
-
-function parseMetadata(d) {
-  let o = 1;
-  const ua = new PublicKey(d.slice(o, o + 32)); o += 32;
-  const mint = new PublicKey(d.slice(o, o + 32)); o += 32;
-  const str = () => { const n = d.readUInt32LE(o); o += 4; const s = d.slice(o, o + n).toString("utf8").replace(/\0/g, ""); o += n; return s; };
-  const name = str(), symbol = str(), uri = str();
-  const fee = d.readUInt16LE(o); o += 2;
-  const creators = [];
-  if (d[o++] === 1) {
-    const n = d.readUInt32LE(o); o += 4;
-    for (let i = 0; i < n; i++) { creators.push({ address: new PublicKey(d.slice(o, o + 32)).toBase58(), verified: d[o + 32] === 1, share: d[o + 33] }); o += 34; }
-  }
-  return { ua, mint, name, symbol, uri, fee, creators };
-}
-
-// What does this NFT still need? update = fee/creator list wrong; verify = creator not yet signed.
-function plan(m) {
-  const c = m.creators;
-  const listOk = c.length === 1 && c[0].address === CREATOR.toBase58() && c[0].share === 100;
-  const update = m.fee !== TARGET_BPS || !listOk;
-  const verify = update ? true : !c[0].verified;
-  return { update, verify };
-}
-
-function updateRoyaltyIx(authority, metadata) {
-  const disc = crypto.createHash("sha256").update("global:update_royalty").digest().slice(0, 8);
-  const bps = Buffer.alloc(2); bps.writeUInt16LE(TARGET_BPS);
+// update_royalty(seller_fee_basis_points: u16, creators: Vec<CreatorArg{address, share}>)
+function updateRoyaltyIx(program, mintState, authority, metadata, bps = K.FINAL_BPS, creator = K.FINAL_CREATOR) {
+  const b = Buffer.alloc(2); b.writeUInt16LE(bps);
   const len = Buffer.alloc(4); len.writeUInt32LE(1);
-  const data = Buffer.concat([disc, bps, len, CREATOR.toBuffer(), Buffer.from([100])]);
   return new TransactionInstruction({
-    programId: PROGRAM,
+    programId: new PublicKey(program),
     keys: [
-      { pubkey: MINT_STATE, isSigner: false, isWritable: false },
-      { pubkey: authority,  isSigner: true,  isWritable: false },
-      { pubkey: metadata,   isSigner: false, isWritable: true  },
-      { pubkey: MPL,        isSigner: false, isWritable: false },
+      { pubkey: new PublicKey(mintState), isSigner: false, isWritable: false },
+      { pubkey: new PublicKey(authority), isSigner: true, isWritable: false },
+      { pubkey: new PublicKey(metadata), isSigner: false, isWritable: true },
+      { pubkey: K.MPL, isSigner: false, isWritable: false },
     ],
-    data,
+    data: Buffer.concat([DISC, b, len, new PublicKey(creator).toBuffer(), Buffer.from([100])]),
   });
 }
-
-// Metaplex SignMetadata (instruction 7): creator signs to flip its own verified flag.
-const signMetadataIx = (metadata) => new TransactionInstruction({
-  programId: MPL,
+// Metaplex SignMetadata (7) / RemoveCreatorVerification (28): the creator flips its OWN flag.
+const creatorFlagIx = (code, metadata, creator) => new TransactionInstruction({
+  programId: K.MPL,
   keys: [
-    { pubkey: metadata, isSigner: false, isWritable: true },
-    { pubkey: CREATOR,  isSigner: true,  isWritable: false },
+    { pubkey: new PublicKey(metadata), isSigner: false, isWritable: true },
+    { pubkey: new PublicKey(creator), isSigner: true, isWritable: false },
   ],
-  data: Buffer.from([7]),
+  data: Buffer.from([code]),
 });
+const signMetadataIx = (metadata, creator) => creatorFlagIx(7, metadata, creator);
+const removeCreatorVerificationIx = (metadata, creator) => creatorFlagIx(28, metadata, creator);
 
-function buildTx(authority, m, p) {
-  const md = mdPda(m.mint);
-  const tx = new Transaction()
-    .add(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 1_000_000 }))
-    .add(ComputeBudgetProgram.setComputeUnitLimit({ units: 200_000 }));
-  if (p.update) tx.add(updateRoyaltyIx(authority, md));
-  if (p.verify) tx.add(signMetadataIx(md));
-  tx.feePayer = authority;
-  return tx;
+// The instructions for one token, in order (no compute-budget instructions).
+function royaltyIxs(program, mintState, authority, m, plan) {
+  const ixs = [];
+  for (const a of plan.unverify) ixs.push(removeCreatorVerificationIx(m.pda, a));
+  if (plan.update) ixs.push(updateRoyaltyIx(program, mintState, authority, m.pda));
+  if (plan.sign) ixs.push(signMetadataIx(m.pda, K.FINAL_CREATOR));
+  return ixs;
 }
 
-const fmt = (m) => `${m.fee}bps ` + (m.creators.map(c => `${c.address.slice(0, 4)}…${c.address.slice(-4)}:${c.share}${c.verified ? "✓" : "✗"}`).join(",") || "no-creators");
-const num = (m) => +(m.name.match(/#(\d+)/) || [0, 0])[1];
+const short = (a) => `${a.slice(0, 4)}…${a.slice(-4)}`;
+const fmt = (m) => `${m.fee}bps ` + ((m.creators || []).map((c) => `${short(c.address)}:${c.share}${c.verified ? "✓" : "✗"}`).join(",") || "no-creators");
+const steps = (p) => [p.unverify.length ? `unverify ${p.unverify.map(short).join(",")}` : null, p.update ? "update" : null, p.sign ? "sign GZuB" : null].filter(Boolean).join(" + ");
 
-(async () => {
-  const c = new Connection(cluster.rpc, "confirmed");
-  console.log(`cluster   : ${clusterName} (${cluster.rpc})`);
-  console.log(`program   : ${PROGRAM.toBase58()}`);
-  console.log(`mint_state: ${MINT_STATE.toBase58()}`);
-  console.log(`target    : ${TARGET_BPS}bps, creator ${CREATOR.toBase58()} share 100, verified`);
-  console.log(`mode      : ${SEND ? "SEND" : "DRY-RUN (nothing is signed or sent)"}\n`);
+async function main() {
+  let a;
+  try {
+    a = K.parseArgs(process.argv.slice(2), {
+      flags: ["--send", "--confirm-mainnet", "--collection"],
+      opts: {
+        "--token": K.V.tokenNumber, "--limit": K.V.positiveInt, "--rpc": K.V.url, "--program": K.V.pubkey, "--priority": K.V.nonNegInt,
+        "--authority-keypair": K.V.any, "--creator-keypair": K.V.any, "--old-treasury-keypair": K.V.any,
+      },
+    });
+  } catch (e) { console.error("Refusing:", e.message); process.exit(1); }
+  const has = (f) => a.flags.has(f);
+  const SEND = has("--send"), COLL = has("--collection");
+  const ONLY_TOKEN = a.opts["--token"] !== undefined ? +a.opts["--token"] : null;
+  if (COLL && ONLY_TOKEN !== null) { console.error("Refusing: --collection and --token are exclusive."); process.exit(1); }
+  if (SEND && !has("--confirm-mainnet")) { console.error("Refusing: --send on mainnet requires --confirm-mainnet as well."); process.exit(1); }
+  const RPC = a.opts["--rpc"] || K.DEFAULT_RPC;
+  const PROGRAM = new PublicKey(a.opts["--program"] || K.DEFAULT_PROGRAM);
+  const PRIORITY = a.opts["--priority"] !== undefined ? +a.opts["--priority"] : 1_000_000;
+  const LIMIT = a.opts["--limit"] !== undefined ? +a.opts["--limit"] : 0;
+  const KP = {
+    authority: a.opts["--authority-keypair"] || DEFAULT_KP.authority,
+    creator: a.opts["--creator-keypair"] || DEFAULT_KP.creator,
+    oldTreasury: a.opts["--old-treasury-keypair"] || DEFAULT_KP.oldTreasury,
+  };
+  const MINT_STATE = K.mintStatePda(PROGRAM);
+  const MS = MINT_STATE.toBase58();
+  const isColl = (m) => m.pda === K.COLLECTION_METADATA;
+  const label = (m) => (isColl(m) ? "collection" : `#${K.num(m)}`);
+
+  const c = new Connection(RPC, "confirmed");
+  console.log(`rpc       : ${RPC}\nprogram   : ${PROGRAM.toBase58()}\nmint_state: ${MS}`);
+  console.log(`target    : ${K.FINAL_BPS} bps, [${K.FINAL_CREATOR}:100 verified]`);
+  console.log(`scope     : ${COLL ? "collection NFT only" : ONLY_TOKEN !== null ? `member #${ONLY_TOKEN}` : "all 500 members"}`);
+  console.log(`mode      : ${SEND ? "SEND" : "DRY-RUN (nothing is signed or sent; no keypair is opened)"}\n`);
 
   const ms = await c.getAccountInfo(MINT_STATE);
   if (!ms) throw new Error("mint_state account not found on this cluster");
   const authority = new PublicKey(ms.data.slice(12, 44));
+  const { members, collection, ignored } = await K.discover(c, MINT_STATE);
   console.log(`authority : ${authority.toBase58()} (from mint_state)`);
+  console.log(`discovered: ${members.length} verified members of ${K.COLLECTION_MINT} + the collection NFT` +
+    (ignored.length ? ` (${ignored.length} other account(s) naming mint_state ignored, never touched)` : ""));
 
-  // ── Discover ─────────────────────────────────────────────────────────
-  let items;
-  if (ONLY_MINT) {
-    const acc = await c.getAccountInfo(mdPda(new PublicKey(ONLY_MINT)));
-    if (!acc) throw new Error("no metadata account for mint " + ONLY_MINT);
-    items = [parseMetadata(acc.data)];
-  } else {
-    const accs = await c.getProgramAccounts(MPL, { filters: [{ memcmp: { offset: 1, bytes: MINT_STATE.toBase58() } }] });
-    // members only — the collection NFT has no "#N" in its name and is left alone
-    items = accs.map(a => parseMetadata(a.account.data)).filter(m => /#\d+/.test(m.name)).sort((a, b) => num(a) - num(b));
+  const items = COLL ? [collection] : ONLY_TOKEN !== null ? members.filter((m) => K.num(m) === ONLY_TOKEN) : members;
+  const planned = items.map((m) => ({ m, p: K.royaltyPlan(m, MS) }));
+  const groups = {};
+  for (const { m, p } of planned) {
+    const g = p.done ? "already final" : p.blocked ? `BLOCKED: ${p.blocked}` : `${fmt(m)} -> ${steps(p)}`;
+    (groups[g] = groups[g] || []).push(label(m));
   }
-  for (const m of items) if (!m.ua.equals(MINT_STATE)) throw new Error(`${m.mint.toBase58()}: update authority is ${m.ua.toBase58()}, not mint_state`);
-
-  // ── Diff ─────────────────────────────────────────────────────────────
-  const targetStr = `${TARGET_BPS}bps ${CREATOR.toBase58().slice(0, 4)}…${CREATOR.toBase58().slice(-4)}:100✓`;
-  let pending = [];
-  for (const m of items) {
-    const p = plan(m);
-    const action = p.update ? "UPDATE+VERIFY" : p.verify ? "VERIFY" : "ok (skip)";
-    console.log(`${m.name.padEnd(22)} ${m.mint.toBase58().padEnd(44)} ${fmt(m).padEnd(28)} -> ${targetStr}  ${action}`);
-    if (p.update || p.verify) pending.push({ m, p });
-  }
-  console.log(`\n${items.length} NFTs: ${items.length - pending.length} already correct, ${pending.length} to change`);
+  console.log(`\n${items.length} target(s) by current state:`);
+  for (const [g, l] of Object.entries(groups)) console.log(`  ${String(l.length).padStart(3)}  ${g}   (${l.slice(0, 6).join(" ")}${l.length > 6 ? " …" : ""})`);
+  const blocked = planned.filter((x) => !x.p.done && x.p.blocked);
+  if (blocked.length) { console.error(`\nRefusing: ${blocked.length} target(s) cannot reach the final royalty.`); process.exit(1); }
+  let pending = planned.filter((x) => !x.p.done);
+  console.log(`\n${items.length} target(s): ${items.length - pending.length} already final, ${pending.length} to change` +
+    (COLL ? "" : `, of which ${pending.filter((x) => x.p.unverify.length).length} need the Gowv5 un-verify`));
   if (LIMIT && pending.length > LIMIT) { pending = pending.slice(0, LIMIT); console.log(`--limit ${LIMIT}: only processing the first ${LIMIT}`); }
   if (!pending.length) return;
 
+  const buildTx = (auth, m, p) => {
+    const tx = new Transaction()
+      .add(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: PRIORITY }))
+      .add(ComputeBudgetProgram.setComputeUnitLimit({ units: 150_000 })); // 68,454 CU measured for the 3-step tx (LiteSVM, X1 Metaplex)
+    for (const ix of royaltyIxs(PROGRAM, MINT_STATE, auth, m, p)) tx.add(ix);
+    tx.feePayer = auth;
+    return tx;
+  };
+
   if (!SEND) {
-    // Read-only simulation of the first pending tx: shows whether the deployed
-    // program has update_royalty yet. No signatures involved.
-    const { m, p } = pending[0];
-    const tx = buildTx(authority, m, p);
-    tx.recentBlockhash = (await c.getLatestBlockhash()).blockhash;
-    const sim = await c.simulateTransaction(tx);
-    console.log(`\nsimulation of ${m.name}: ${sim.value.err ? "FAILS " + JSON.stringify(sim.value.err) : "ok"}`);
-    if (sim.value.err) {
-      (sim.value.logs || []).slice(-6).forEach(l => console.log("   " + l));
-      console.log("   (InstructionFallbackNotFound / 0x65 = the deployed program does not have update_royalty yet)");
+    // Read-only simulation of the first pending tx of each distinct step pattern (no signatures).
+    const seen = new Set();
+    const { blockhash } = await c.getLatestBlockhash();
+    for (const { m, p } of pending) {
+      const key = steps(p);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const tx = buildTx(authority, m, p);
+      tx.recentBlockhash = blockhash;
+      const sim = await c.simulateTransaction(tx).catch((e) => ({ value: { err: e.message, logs: [] } }));
+      console.log(`simulation of ${label(m)} (${key}): ${sim.value.err ? "FAILS " + JSON.stringify(sim.value.err) : `ok (${sim.value.unitsConsumed} CU)`}`);
+      if (sim.value.err) (sim.value.logs || []).slice(-6).forEach((l) => console.log("   " + l));
     }
-    console.log("\nDry-run only. Re-run with --send to apply.");
+    console.log("\nDry run. Nothing sent. Add --send --confirm-mainnet to apply.");
     return;
   }
 
   // ── Send ─────────────────────────────────────────────────────────────
-  if (clusterName === "mainnet" && !flag("--confirm-mainnet")) throw new Error("refusing to send on mainnet without --confirm-mainnet");
   const load = (f) => Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync(f))));
-  const authKp = load(AUTH_KP), creatorKp = load(CREATOR_KP);
-  if (!authKp.publicKey.equals(authority)) throw new Error(`${AUTH_KP} is ${authKp.publicKey.toBase58()}, not mint_state.authority`);
-  if (!creatorKp.publicKey.equals(CREATOR)) throw new Error(`${CREATOR_KP} is ${creatorKp.publicKey.toBase58()}, not the target creator`);
+  const authKp = load(KP.authority);
+  if (!authKp.publicKey.equals(authority)) throw new Error(`${KP.authority} is ${authKp.publicKey.toBase58()}, not mint_state.authority ${authority.toBase58()}`);
+  const creatorKp = load(KP.creator);
+  if (creatorKp.publicKey.toBase58() !== K.FINAL_CREATOR) throw new Error(`${KP.creator} is ${creatorKp.publicKey.toBase58()}, not ${K.FINAL_CREATOR}`);
+  let oldKp = null;
+  if (pending.some((x) => x.p.unverify.length)) {
+    oldKp = load(KP.oldTreasury);
+    if (oldKp.publicKey.toBase58() !== K.OLD_TREASURY) throw new Error(`${KP.oldTreasury} is ${oldKp.publicKey.toBase58()}, not ${K.OLD_TREASURY}`);
+  }
+  console.log(`\nsigning as ${authKp.publicKey.toBase58()} (authority), ${K.FINAL_CREATOR} (creator)${oldKp ? `, ${K.OLD_TREASURY} (un-verify)` : ""}`);
 
-  let ok = 0, failed = 0;
-  const one = async ({ m, p }) => {
+  let sent = 0, failed = 0;
+  const failures = [];
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  for (const { m, p } of pending) {
+    process.stdout.write(`${label(m).padStart(10)} … `);
+    let sig;
     try {
-      const sig = await sendAndConfirmTransaction(c, buildTx(authority, m, p), [authKp, creatorKp], { commitment: "confirmed" });
-      // read back and check before counting it done
-      const after = parseMetadata((await c.getAccountInfo(mdPda(m.mint), "confirmed")).data);
-      const q = plan(after);
-      if (q.update || q.verify) throw new Error("post-check mismatch: " + fmt(after));
-      ok++; console.log(`OK   ${m.name.padEnd(22)} ${sig}`);
-    } catch (e) { failed++; console.log(`FAIL ${m.name.padEnd(22)} ${m.mint.toBase58()} ${e.message.split("\n")[0]}`); }
-  };
-  for (let i = 0; i < pending.length; i += CONCURRENCY) await Promise.all(pending.slice(i, i + CONCURRENCY).map(one));
-  console.log(`\ndone: ${ok} updated, ${failed} failed${failed ? " — rerun to retry (finished NFTs are skipped)" : ""}`);
-  if (failed) process.exit(1);
-})().catch(e => { console.error("ERR", e.message); process.exit(1); });
+      const signers = [authKp];
+      if (p.sign) signers.push(creatorKp);
+      if (p.unverify.length) signers.push(oldKp);
+      sig = await sendAndConfirmTransaction(c, buildTx(authKp.publicKey, m, p), signers, { commitment: "confirmed" });
+    } catch (e) {
+      console.log(`FAILED — ${e.message.split("\n")[0].slice(0, 140)}`);
+      failed++; failures.push({ tag: label(m), error: e.message });
+      await sleep(400);
+      continue;
+    }
+    const rb = await K.readBack(c, m.pda, K.royaltyIsFinal, (x) => K.fingerprint(x, "fee", "creators") === K.fingerprint(m, "fee", "creators", "pda"));
+    if (!rb.ok) {
+      console.log(`${sig}\n\nSTOP: post-send check failed for ${label(m)}${rb.notLanded ? ` (final royalty not visible after ${rb.tries} reads; re-run to re-check)` : " (a field other than royalty/creators changed)"}.`);
+      console.log("before:", JSON.stringify(m));
+      console.log("after :", JSON.stringify(rb.after));
+      process.exit(2);
+    }
+    console.log(sig);
+    sent++;
+    await sleep(400);
+  }
+  console.log(`\nupdated: ${sent}   failed: ${failed}`);
+  if (failures.length) {
+    console.log("failures (re-run the same command to retry only these):");
+    failures.slice(0, 20).forEach((f) => console.log(`  ${f.tag}  ${f.error.split("\n")[0].slice(0, 100)}`));
+    process.exit(1);
+  }
+}
+
+if (require.main === module) main().catch((e) => { console.error("ERR", e.message); process.exit(1); });
+module.exports = { updateRoyaltyIx, signMetadataIx, removeCreatorVerificationIx, royaltyIxs, DISC };

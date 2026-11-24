@@ -17,8 +17,13 @@
 //          --revert   send targets back to the ORIGINAL Vercel URI (members: …/metadata/N,
 //                     collection: …/metadata/0). The undo for a pilot or partial sweep. Needs no --map.
 //          --skip-vercel-compare        (verify) don't fetch Vercel; use once the site is gone
-//          --allow-vercel-diff <paths>  (verify) comma list of JSON paths allowed to differ from Vercel,
-//                                       e.g. image,properties.files.0.uri  (default: none)
+//          --allow-vercel-diff external_url
+//                                       (verify) the ONLY path that may be exempted from the Vercel
+//                                       compare (audit L1): the pinned JSONs carry the new external_url,
+//                                       Vercel's main does not. Matched as an exact path. Its new value
+//                                       is checked anyway: every JSON must say K.EXTERNAL_URL.
+//                                       image, files, name, attributes … can never be exempted: deploy
+//                                       rise-phoenix-nft main to Vercel first if they differ.
 //
 // Safety:
 //   * Dry-run is the default and never reads a keypair file.
@@ -30,6 +35,8 @@
 //     other field (including the raw trailing bytes) must equal its pre-send value. Else exit 2.
 //   * --verify (S1): JSON name must be "RISE Phoenix #(N+1)" (and attribute Number N+1), and the new
 //     JSON must equal, field for field, what Vercel serves today for the same N.
+//   * A FULL passing --verify (all 500 members with the Vercel compare, or --collection) records the
+//     map's sha256 in <map>.verified.json; lock_metadata.cjs refuses without it (audit L3).
 
 const { Connection, PublicKey, Keypair, Transaction, TransactionInstruction, ComputeBudgetProgram, sendAndConfirmTransaction } = require("@solana/web3.js");
 const crypto = require("crypto"), fs = require("fs");
@@ -126,6 +133,10 @@ async function main() {
   const PRIORITY = a.opts["--priority"] !== undefined ? +a.opts["--priority"] : 1_000_000;
   const AUTH_KP = a.opts["--authority-keypair"] || process.env.HOME + "/.config/solana/rise-mint-authority.json";
   const ALLOW_DIFF = (a.opts["--allow-vercel-diff"] || "").split(",").map((s) => s.trim()).filter(Boolean);
+  const EXEMPTABLE = ["external_url"];
+  const badAllow = ALLOW_DIFF.filter((x) => !EXEMPTABLE.includes(x));
+  if (badAllow.length) { console.error(`Refusing: --allow-vercel-diff accepts only ${EXEMPTABLE.join(",")} (audit L1), not ${badAllow.join(",")}. If image/files/attributes differ, deploy rise-phoenix-nft main to Vercel so the compare is exact.`); process.exit(1); }
+  if (ALLOW_DIFF.length && !has("--verify")) { console.error("Refusing: --allow-vercel-diff only applies to --verify."); process.exit(1); }
 
   if (SEND && !has("--confirm-mainnet")) { console.error("Refusing: --send on mainnet requires --confirm-mainnet as well."); process.exit(1); }
   if (!REVERT && !MAP_PATH) { console.error("--map <file> is required (or --revert to go back to the Vercel URIs)."); process.exit(1); }
@@ -170,6 +181,7 @@ async function main() {
       try {
         const meta = await getJson(want);
         const p = [];
+        if (meta.external_url !== K.EXTERNAL_URL) p.push(`external_url is ${JSON.stringify(meta.external_url)}, want ${JSON.stringify(K.EXTERNAL_URL)}`);
         if (k === K.COLLECTION_KEY) {
           if (meta.name !== "RISE Phoenix") p.push(`collection JSON name is ${JSON.stringify(meta.name)}, want "RISE Phoenix"`);
         } else {
@@ -177,7 +189,7 @@ async function main() {
           p.push(...checkMemberJson(k, meta));
           if (!has("--skip-vercel-compare")) {
             const vercel = await getJson(`${K.OLD_BASE}${k}`);
-            const diffs = K.jsonDiff(vercel, meta).filter((d) => !ALLOW_DIFF.some((pre) => d === pre || d.startsWith(pre + ":") || d.startsWith(pre + ".")));
+            const diffs = K.jsonDiff(vercel, meta).filter((d) => !ALLOW_DIFF.some((path) => d.startsWith(path + ": "))); // exact path only
             for (const d of diffs) { const path = d.split(":")[0]; diffTally[path] = (diffTally[path] || 0) + 1; }
             if (diffs.length) p.push(`differs from Vercel /api/metadata/${k}: ${diffs.slice(0, 3).join("; ")}${diffs.length > 3 ? ` (+${diffs.length - 3})` : ""}`);
           }
@@ -195,6 +207,13 @@ async function main() {
       Object.entries(diffTally).sort((x, y) => y[1] - x[1]).forEach(([p, n]) => console.log(`  ${p}: ${n}`));
     }
     if (problems.length) { console.log("\nproblems:"); problems.slice(0, 60).forEach((p) => console.log("  " + p)); process.exit(1); }
+    // Record what passed (audit L3). Members only from a full run that compared with Vercel.
+    const scope = COLL ? "collection" : ONLY_TOKEN === null && !has("--skip-vercel-compare") && items.length === K.EXPECTED_MEMBERS ? "members" : null;
+    if (scope) {
+      const r = K.writeVerifyRecord(MAP_PATH, scope, { checked: items.length, rpc: RPC, allow_vercel_diff: ALLOW_DIFF, external_url: K.EXTERNAL_URL });
+      console.log(`\nrecorded: ${K.recordPath(MAP_PATH)} ${scope} map_sha256 ${r.map_sha256}`);
+      console.log(`lock_metadata.cjs needs --map-sha256 ${r.map_sha256}`);
+    } else console.log("\n(partial or --skip-vercel-compare run: nothing recorded for lock_metadata.cjs)");
     return;
   }
 

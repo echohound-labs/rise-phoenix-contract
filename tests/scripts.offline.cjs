@@ -1,5 +1,5 @@
-// Offline checks for sweep_uri.cjs, lock_metadata.cjs, pin_metadata.cjs and
-// rise_meta_common.cjs. No network: RPC calls go to fake connection objects,
+// Offline checks for sweep_uri.cjs, lock_metadata.cjs, pin_metadata.cjs, update_royalty.cjs,
+// incinerate_collection.cjs and rise_meta_common.cjs. No network: RPC calls go to fake connection objects,
 // and refusal paths are exercised only where they exit before any network call.
 // Prereqs: `anchor build`, then `cd tests/svm && cargo test --offline` (writes the metadata dumps).
 // Run: node tests/scripts.offline.cjs
@@ -11,6 +11,9 @@ const K = require(path.join(repo, "rise_meta_common.cjs"));
 const sweep = require(path.join(repo, "sweep_uri.cjs"));
 const lockS = require(path.join(repo, "lock_metadata.cjs"));
 const pin = require(path.join(repo, "pin_metadata.cjs"));
+const roy = require(path.join(repo, "update_royalty.cjs"));
+const inc = require(path.join(repo, "incinerate_collection.cjs"));
+const mainnetFx = path.join(repo, "tests/svm/fixtures/mainnet");
 const dumps = path.join(repo, "tests/svm/target/metadata-dumps");
 const idl = JSON.parse(fs.readFileSync(path.join(repo, "target/idl/rise_phoenix_contract.json")));
 let n = 0;
@@ -129,26 +132,115 @@ const fakeConn = (list) => ({ getProgramAccounts: async () => list, getAccountIn
   assert.deepStrictEqual([rb.ok, rb.tries, rb.notLanded], [false, 1, undefined]);
   ok("S6: read-back retries past null/stale reads; stops at once if another field changed");
 
-  // ── lock gates ──
-  const target = { bps: 100, creator: "Gowv5PDb7K4a5PwjubWegvBT4CDfjjJcG4QAZWa9yUob" };
-  const mm = (o) => K.parseMetadata(encMd({ ua: MS, mint: m7.mint, name: "RISE Phoenix #7", uri: "https://ipfs.x1forge.xyz/ipfs/QmNew", coll: { verified: true, key: K.COLLECTION_MINT }, ...o }));
-  assert.deepStrictEqual(lockS.gate(mm({}), { isCollection: false, wantUri: "https://ipfs.x1forge.xyz/ipfs/QmNew", ...target }), []);
-  assert.ok(lockS.gate(mm({}), { isCollection: false, wantUri: "https://ipfs.x1forge.xyz/ipfs/QmOther", ...target }).length === 1, "uri != map");
-  assert.ok(lockS.gate(mm({ uri: K.OLD_BASE + 7 }), { isCollection: false, wantUri: K.OLD_BASE + 7, ...target }).some((x) => /vercel/.test(x)), "still on Vercel");
-  assert.ok(lockS.gate(mm({ fee: 500, creators: [{ address: MS, verified: true, share: 100 }] }), { isCollection: false, wantUri: "https://ipfs.x1forge.xyz/ipfs/QmNew", ...target }).length === 2, "the 283 not yet on the final royalty");
-  assert.ok(lockS.gate(mm({ creators: [{ address: target.creator, verified: false, share: 100 }] }), { isCollection: false, wantUri: "https://ipfs.x1forge.xyz/ipfs/QmNew", ...target }).length === 1, "unverified treasury");
-  assert.deepStrictEqual(lockS.gate(K.parseMetadata(encMd({ ua: MS, mint: K.COLLECTION_MINT, name: "RISE Phoenix", uri: "https://ipfs.x1forge.xyz/ipfs/QmC", fee: 500 })), { isCollection: true, wantUri: "https://ipfs.x1forge.xyz/ipfs/QmC", ...target }), []);
-  ok("lock gates: uri must equal map and be off Vercel; members need 100 bps + verified treasury");
+  // ── lock gates (owner decision: 300 bps + GZuB verified, members AND collection; no override) ──
+  assert.strictEqual(K.FINAL_BPS, 300); assert.strictEqual(K.FINAL_CREATOR, "GZuBHE3fQCQ6eSTLMwWKrK15CjtWfA58BmxdtWwG5mJJ");
+  const FIN = [{ address: K.FINAL_CREATOR, verified: true, share: 100 }], NEWU = "https://ipfs.x1forge.xyz/ipfs/QmNew";
+  const mm = (o) => K.parseMetadata(encMd({ ua: MS, mint: m7.mint, name: "RISE Phoenix #7", uri: NEWU, fee: 300, creators: FIN, coll: { verified: true, key: K.COLLECTION_MINT }, ...o }));
+  const G = (m, wantUri = NEWU, isCollection = false) => lockS.gate(m, { isCollection, wantUri });
+  assert.deepStrictEqual(G(mm({})), []);
+  assert.ok(G(mm({}), "https://ipfs.x1forge.xyz/ipfs/QmOther").length === 1, "uri != map");
+  assert.ok(G(mm({ uri: K.OLD_BASE + 7 }), K.OLD_BASE + 7).some((x) => /vercel/.test(x)), "still on Vercel");
+  assert.ok(G(mm({ fee: 500, creators: [{ address: MS, verified: true, share: 100 }] })).length === 2, "the 283 shape");
+  assert.ok(G(mm({ fee: 100, creators: [{ address: K.OLD_TREASURY, verified: true, share: 100 }] })).length === 2, "the 217 shape (old 1% target) is now refused");
+  assert.ok(G(mm({ creators: [{ address: K.FINAL_CREATOR, verified: false, share: 100 }] })).length === 1, "unverified GZuB");
+  assert.ok(G(mm({ fee: 100 })).length === 1, "bps only");
+  const collM = (o) => K.parseMetadata(encMd({ ua: MS, mint: K.COLLECTION_MINT, name: "RISE Phoenix", uri: "https://ipfs.x1forge.xyz/ipfs/QmC", fee: 300, creators: FIN, ...o }));
+  assert.deepStrictEqual(G(collM({}), "https://ipfs.x1forge.xyz/ipfs/QmC", true), []);
+  assert.ok(G(collM({ fee: 500, creators: [{ address: MS, verified: true, share: 100 }] }), "https://ipfs.x1forge.xyz/ipfs/QmC", true).length === 2, "collection royalty is gated now (L3)");
+  ok("lock gates: uri == map, off Vercel; members AND collection need 300 bps + [GZuB:100 verified]");
+
+  // ── royalty plan on REAL bytes: mainnet accounts (before) and LiteSVM on X1 Metaplex (after) ──
+  const R = (f) => K.parseMetadata(fs.readFileSync(f));
+  const b283 = R(path.join(mainnetFx, "member0_283_mintstate.bin")), b217 = R(path.join(mainnetFx, "member1_217_gowv5.bin")), bColl = R(path.join(mainnetFx, "collection_FRN2yo3.bin"));
+  const strip = (p) => ({ unverify: p.unverify, update: p.update, sign: p.sign, blocked: p.blocked });
+  assert.deepStrictEqual(strip(K.royaltyPlan(b283, MS)), { unverify: [], update: true, sign: true, blocked: null });
+  assert.deepStrictEqual(strip(K.royaltyPlan(b217, MS)), { unverify: [K.OLD_TREASURY], update: true, sign: true, blocked: null });
+  assert.deepStrictEqual(strip(K.royaltyPlan(bColl, MS)), { unverify: [], update: true, sign: true, blocked: null });
+  for (const f of ["royalty_283_after.bin", "royalty_217_after.bin", "royalty_collection_after.bin", "royalty_217_locked.bin"]) {
+    const a = R(path.join(dumps, f));
+    assert.ok(K.royaltyIsFinal(a) && K.royaltyPlan(a, MS).done, f);
+    assert.ok(!lockS.gate(a, { isCollection: f.includes("collection"), wantUri: a.uri }).some((x) => /royalty|creators/.test(x)), f + " passes the lock royalty gate");
+  }
+  assert.strictEqual(K.fingerprint(b217, "fee", "creators"), K.fingerprint(R(path.join(dumps, "royalty_217_after.bin")), "fee", "creators"), "read-back comparator: only fee/creators differ");
+  assert.strictEqual(K.fingerprint(bColl, "fee", "creators"), K.fingerprint(R(path.join(dumps, "royalty_collection_after.bin")), "fee", "creators"));
+  assert.ok(lockS.gate(b283, { isCollection: false, wantUri: b283.uri }).length >= 2 && lockS.gate(b217, { isCollection: false, wantUri: b217.uri }).length >= 2);
+  assert.ok(K.royaltyPlan({ ...b217, isMutable: false }, MS).blocked.includes("locked"), "locked and not final: blocked");
+  const stranger = Keypair.generate().publicKey.toBase58();
+  assert.ok(K.royaltyPlan({ ...b217, creators: [{ address: stranger, verified: true, share: 100 }] }, MS).blocked.includes(stranger), "unknown verified creator: blocked");
+  assert.deepStrictEqual(strip(K.royaltyPlan({ ...b217, fee: 300, creators: [{ address: K.FINAL_CREATOR, verified: false, share: 100 }] }, MS)), { unverify: [], update: false, sign: true, blocked: null }, "sign only");
+  assert.deepStrictEqual(strip(K.royaltyPlan({ ...b217, fee: 100, creators: [{ address: K.FINAL_CREATOR, verified: true, share: 100 }] }, MS)), { unverify: [], update: true, sign: false, blocked: null }, "bps only: GZuB keeps its flag");
+  ok("royalty plan on real bytes: 283 → update+sign, 217 → unverify Gowv5+update+sign, collection → update+sign; LiteSVM results are final");
+
+  // ── update_royalty.cjs instruction bytes (same as tests/svm/tests/royalty_final.rs) ──
+  const m217 = { ...b217, pda: K.mdPda(b217.mint).toBase58() };
+  const ixs = roy.royaltyIxs(prog, ms, auth, m217, K.royaltyPlan(b217, MS));
+  assert.deepStrictEqual(ixs.map((x) => x.programId.toBase58()), [K.MPL.toBase58(), prog.toBase58(), K.MPL.toBase58()]);
+  assert.deepStrictEqual([...ixs[0].data], [28]); assert.deepStrictEqual([...ixs[2].data], [7]);
+  assert.deepStrictEqual(ixs[0].keys.map((k) => [k.pubkey.toBase58(), k.isSigner, k.isWritable]), [[m217.pda, false, true], [K.OLD_TREASURY, true, false]]);
+  assert.deepStrictEqual(ixs[2].keys.map((k) => [k.pubkey.toBase58(), k.isSigner, k.isWritable]), [[m217.pda, false, true], [K.FINAL_CREATOR, true, false]]);
+  const idlRoy = idl.instructions.find((i) => i.name === "update_royalty");
+  assert.deepStrictEqual([...roy.DISC], idlRoy.discriminator);
+  assert.strictEqual(ixs[1].data.toString("hex"), roy.DISC.toString("hex") + "2c01" + "01000000" + new PublicKey(K.FINAL_CREATOR).toBuffer().toString("hex") + "64");
+  assert.deepStrictEqual(ixs[1].keys.map((k) => [k.pubkey.toBase58(), k.isSigner, k.isWritable]), [[ms.toBase58(), false, false], [auth.toBase58(), true, false], [m217.pda, false, true], [K.MPL.toBase58(), false, false]]);
+  assert.strictEqual(roy.royaltyIxs(prog, ms, auth, { ...b283, pda: K.mdPda(b283.mint).toBase58() }, K.royaltyPlan(b283, MS)).length, 2);
+  ok("update_royalty.cjs: [RemoveCreatorVerification(Gowv5)] + update_royalty(300,[GZuB:100]) + SignMetadata(GZuB), IDL discriminator");
+
+  // ── map sha256 record (audit L3) ──
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "rise-map-"));
+  const mp = path.join(tmp, "uri_map.json");
+  fs.writeFileSync(mp, JSON.stringify({ ...good, collection: "https://ipfs.x1forge.xyz/ipfs/QmCollection" }));
+  const sh = K.sha256File(mp);
+  assert.ok(K.checkVerifyRecord(mp, ["members"], sh).some((x) => /no passing/.test(x)), "no record yet");
+  K.writeVerifyRecord(mp, "members", { checked: 500 });
+  assert.deepStrictEqual(K.checkVerifyRecord(mp, ["members"], sh), []);
+  assert.ok(K.checkVerifyRecord(mp, ["members", "collection"], sh).some((x) => /collection/.test(x)), "collection scope missing");
+  assert.ok(K.checkVerifyRecord(mp, ["members"], "0".repeat(64)).some((x) => /--map-sha256 says/.test(x)), "wrong hand-recorded sha");
+  assert.ok(K.checkVerifyRecord(mp, ["members"], "abc").length > 0, "malformed sha");
+  fs.writeFileSync(mp, JSON.stringify({ ...good, 7: "https://ipfs.x1forge.xyz/ipfs/QmTampered" }));
+  const sh2 = K.sha256File(mp);
+  assert.ok(K.checkVerifyRecord(mp, ["members"], sh2).some((x) => /verified against map sha256/.test(x)), "map edited after verify");
+  ok("map record: lock needs --map-sha256 == file == the sha256 a full --verify recorded, per scope");
+
+  // ── incinerate_collection.cjs ──
+  assert.strictEqual(inc.ata(inc.INCINERATOR).toBase58(), inc.EXPECTED_DEST);
+  assert.strictEqual(PublicKey.isOnCurve(inc.INCINERATOR.toBuffer()), false);
+  const holderPk = new PublicKey("BAMEPccJucUMiVnsPJ2V9VzH5m3Q1TD9QDZJhrof4Nxy"), src = inc.ata(holderPk);
+  assert.strictEqual(src.toBase58(), "5aPXdprGkQ5pqbLoeh7tmvq2YU5itXW8inDCcGSs8fy2", "the holder ATA read from mainnet");
+  const [cr, tr] = inc.incinerateIxs(holderPk, src);
+  assert.deepStrictEqual([...cr.data], [1]); assert.strictEqual(cr.keys[1].pubkey.toBase58(), inc.EXPECTED_DEST); assert.strictEqual(cr.keys[2].pubkey.toBase58(), inc.INCINERATOR.toBase58());
+  assert.strictEqual(tr.data.toString("hex"), "0c" + "0100000000000000" + "00", "TransferChecked 1, decimals 0");
+  assert.deepStrictEqual(tr.keys.map((k) => [k.pubkey.toBase58(), k.isSigner, k.isWritable]), [[src.toBase58(), false, true], [K.COLLECTION_MINT, false, false], [inc.EXPECTED_DEST, false, true], [holderPk.toBase58(), true, false]]);
+  const ed = inc.editionPda().toBase58();
+  assert.strictEqual(ed, "FjsB7uDCVswotg71cw1hUuuhncyS3gsaY6sDDsTgwrkm");
+  const st = (o = {}) => ({ mint: { supply: 1n, decimals: 0, mintAuthority: ed, freezeAuthority: ed }, holders: [{ address: src.toBase58(), info: { owner: holderPk.toBase58(), amount: 1n, state: 1, delegate: null } }],
+    collection: { ...collM({}), isMutable: false }, lockedMembers: 500, holder: holderPk.toBase58(), ...o });
+  assert.deepStrictEqual(inc.gate(st()), []);
+  assert.ok(inc.gate(st({ collection: collM({}) })).some((x) => /not LOCKED/.test(x)));
+  assert.ok(inc.gate(st({ lockedMembers: 499 })).some((x) => /499\/500/.test(x)));
+  assert.ok(inc.gate(st({ holder: Keypair.generate().publicKey.toBase58() })).some((x) => /holder keypair/.test(x)));
+  assert.ok(inc.gate(st({ holders: [{ address: src.toBase58(), info: { owner: holderPk.toBase58(), amount: 1n, state: 2, delegate: null } }] })).some((x) => /frozen/.test(x)));
+  assert.ok(inc.gate(st({ holders: [{ address: inc.EXPECTED_DEST, info: { owner: inc.INCINERATOR.toBase58(), amount: 1n, state: 1, delegate: null } }] })).some((x) => /already/.test(x)));
+  assert.ok(inc.gate(st({ mint: { supply: 1n, decimals: 0, mintAuthority: holderPk.toBase58(), freezeAuthority: ed } })).some((x) => /mint authority/.test(x)));
+  assert.deepStrictEqual(inc.checkIncinerated({ mint: K.COLLECTION_MINT, owner: inc.INCINERATOR.toBase58(), amount: 1n, delegate: null, closeAuthority: null, state: 1 }, { amount: 0n }), []);
+  assert.ok(inc.checkIncinerated(null, null).length === 1);
+  ok("incinerate_collection.cjs: destination HQSNbZZ… = ATA(off-curve incinerator), CreateIdempotent + TransferChecked(1), gates, post-check");
 
   // ── CIDv0 (cross-checked with `ipfs add -n -q --cid-version 0`) ──
-  const known = { "0-v3.json": "QmW4ZAB4nxKXiTgD7zmdp5Dy1Uo3q7nf82JAbP9E1Gm3Mf", "7-v3.json": "QmUNYcFkNT5ggsLFhSbSapGuxRnHTbQ3wm1Y2mfRrHYspu", "499-v3.json": "QmX2XufZar9miHJqabqQgVFTXJ2SsMCSq2Cbr6vHGvm1wG" };
+  // external_url = https://x1forge.xyz/collection/rise (rise-phoenix-nft branch feat/external-url-x1forge)
+  const known = { "0-v3.json": "QmNUk3bpiFuFoEHSTd3hLxQXWkKKuwWqFissy4bHGsajZv", "7-v3.json": "QmfU3BQiGTEy3fw31rKNeCsWG3eQnoYbQvagRSC44cfMZ5", "499-v3.json": "QmWhKUev1quHyoYAVfnPMVrXB9ur2k5KyBi6NDjZE5npLo" };
   if (fs.existsSync(path.join(metaDir, "0-v3.json"))) for (const [f, cid] of Object.entries(known)) assert.strictEqual(pin.cidV0(fs.readFileSync(path.join(metaDir, f))), cid, f);
   assert.strictEqual(pin.cidV0(fs.readFileSync(path.join(repo, "collection/collection.jpg"))), "QmVU1bDERvZMXyLnxp88wM48HSFFrjenkE3cswzW34CrW8");
   const cj = JSON.parse(fs.readFileSync(path.join(repo, "collection/collection.json")));
   assert.strictEqual(cj.image, "https://ipfs.x1forge.xyz/ipfs/QmVU1bDERvZMXyLnxp88wM48HSFFrjenkE3cswzW34CrW8");
+  assert.strictEqual(cj.external_url, K.EXTERNAL_URL);
+  assert.strictEqual(pin.cidV0(fs.readFileSync(path.join(repo, "collection/collection.json"))), "QmV6Ffa7768oabHppN7L87zwujT1Pa1j3JxhzNkLFSFrVr");
+  if (fs.existsSync(path.join(metaDir, "0-v3.json"))) {
+    const old = fs.readFileSync(path.join(metaDir, "0-v3.json"), "utf8").replace(K.EXTERNAL_URL, "https://rise-phoenix-nft.vercel.app");
+    assert.ok(pin.checkMemberFile(0, Buffer.from(old)).some((x) => /external_url/.test(x)), "old external_url refused by pin");
+  }
   assert.throws(() => pin.cidV0(Buffer.alloc(0)), /empty/);
   assert.throws(() => pin.cidV0(Buffer.alloc(262145)), /chunk/);
-  ok("CIDv0 equals the ipfs CLI for 3 JSONs and the collection image; collection.json points at it");
+  ok("CIDv0 equals the ipfs CLI for 3 JSONs, collection JSON and image; external_url = x1forge.xyz/collection/rise enforced");
 
   // ── refusal paths (exit before any network call) ──
   const run = (script, args) => spawnSync(process.execPath, [path.join(repo, script), ...args], { encoding: "utf8" });
@@ -167,8 +259,31 @@ const fakeConn = (list) => ({ getProgramAccounts: async () => list, getAccountIn
   refuse("lock_metadata.cjs", ["--status", "--send", "--confirm-mainnet"], /read-only/);
   refuse("pin_metadata.cjs", ["--token", "500"], /0\.\.499/);
   refuse("pin_metadata.cjs", ["--executee"], /unknown/);
-  ok("refusal paths: 14 bad invocations exit 1 before any network call");
-  for (const f of ["sweep_uri.cjs", "lock_metadata.cjs", "pin_metadata.cjs", "rise_meta_common.cjs"]) assert.strictEqual(spawnSync(process.execPath, ["--check", path.join(repo, f)]).status, 0);
-  ok("node --check on all four scripts");
+  // L1: only external_url may be exempted from the Vercel compare
+  refuse("sweep_uri.cjs", ["--map", "x.json", "--verify", "--allow-vercel-diff", "image"], /only external_url/);
+  refuse("sweep_uri.cjs", ["--map", "x.json", "--verify", "--allow-vercel-diff", "external_url,properties.files.0.uri"], /only external_url/);
+  refuse("sweep_uri.cjs", ["--map", "x.json", "--verify", "--allow-vercel-diff", "attributes"], /only external_url/);
+  refuse("sweep_uri.cjs", ["--map", "x.json", "--allow-vercel-diff", "external_url"], /only applies to --verify/);
+  // L3: lock needs the recorded map sha256; the old override flags are gone
+  refuse("lock_metadata.cjs", ["--map", "x.json", "--token", "7"], /--map-sha256/);
+  refuse("lock_metadata.cjs", ["--map", "x.json", "--token", "7", "--map-sha256", "0".repeat(64), "--expect-bps", "100"], /unknown argument/);
+  refuse("lock_metadata.cjs", ["--map", mp, "--all", "--map-sha256", sh2], /no passing sweep_uri.cjs --verify recorded for collection|verified against map sha256/);
+  refuse("lock_metadata.cjs", ["--map", mp, "--token", "7", "--map-sha256", sh], /--map-sha256 says|verified against/);
+  // M4: update_royalty.cjs strict
+  refuse("update_royalty.cjs", ["--send"], /confirm-mainnet/);
+  refuse("update_royalty.cjs", ["--limit", "abc"], /positive integer/);
+  refuse("update_royalty.cjs", ["--limit"], /needs a value/);
+  refuse("update_royalty.cjs", ["--mint"], /unknown argument/);
+  refuse("update_royalty.cjs", ["--token", ""], /0\.\.499/);
+  refuse("update_royalty.cjs", ["--cluster", "testnet"], /unknown argument/);
+  refuse("update_royalty.cjs", ["--collection", "--token", "1"], /exclusive/);
+  refuse("update_royalty.cjs", ["--creator", "Gowv5PDb7K4a5PwjubWegvBT4CDfjjJcG4QAZWa9yUob"], /unknown argument/);
+  refuse("incinerate_collection.cjs", ["--send"], /confirm-mainnet/);
+  refuse("incinerate_collection.cjs", ["--verify", "--send", "--confirm-mainnet"], /read-only/);
+  refuse("incinerate_collection.cjs", ["--dest", "x"], /unknown argument/);
+  ok("refusal paths: 33 bad invocations exit 1 before any network call (incl. L1, L3, M4)");
+  for (const f of ["sweep_uri.cjs", "lock_metadata.cjs", "pin_metadata.cjs", "rise_meta_common.cjs", "update_royalty.cjs", "incinerate_collection.cjs"]) assert.strictEqual(spawnSync(process.execPath, ["--check", path.join(repo, f)]).status, 0);
+  ok("node --check on all six scripts");
+  fs.rmSync(tmp, { recursive: true, force: true });
   console.log(`\nALL ${n} OFFLINE CHECK GROUPS PASSED`);
 })().catch((e) => { console.error("FAILED:", e); process.exit(1); });

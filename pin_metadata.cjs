@@ -30,6 +30,7 @@
 //          --collection-dir <dir> (default ./collection), --gateway <https://…/ipfs/>
 
 const fs = require("fs"), os = require("os"), path = require("path"), crypto = require("crypto");
+const { EXTERNAL_URL } = require("./rise_meta_common.cjs"); // owner decision 2026-11-24: x1forge's RISE collection page
 
 const UPLOAD_ENDPOINT = "https://api.pinata.cloud/pinning/pinFileToIPFS";
 const JWT_PATH = path.join(os.homedir(), ".config", "pinata", "jwt");
@@ -67,6 +68,7 @@ function checkMemberFile(n, bytes, GATEWAY = "https://ipfs.x1forge.xyz/ipfs/") {
   const numAttr = (j.attributes || []).find((a) => a && a.trait_type === "Number");
   if (!numAttr || numAttr.value !== n + 1) p.push(`attribute Number ${JSON.stringify(numAttr && numAttr.value)}, want ${n + 1}`);
   if (j.symbol !== "RISE") p.push(`symbol ${JSON.stringify(j.symbol)}`);
+  if (j.external_url !== EXTERNAL_URL) p.push(`external_url ${JSON.stringify(j.external_url)}, want ${JSON.stringify(EXTERNAL_URL)}`);
   if (typeof j.image !== "string" || !j.image.startsWith(GATEWAY)) p.push(`image not on ${GATEWAY}: ${j.image}`);
   const f0 = j.properties && j.properties.files && j.properties.files[0];
   if (!f0 || f0.uri !== j.image) p.push("properties.files[0].uri != image");
@@ -168,6 +170,7 @@ async function main() {
     const imgCid = cidV0(img), j = JSON.parse(json.toString("utf8"));
     const p = [];
     if (j.name !== "RISE Phoenix") p.push(`name ${JSON.stringify(j.name)}`);
+    if (j.external_url !== EXTERNAL_URL) p.push(`external_url ${JSON.stringify(j.external_url)}, want ${JSON.stringify(EXTERNAL_URL)}`);
     if (j.image !== GATEWAY + imgCid) p.push(`image ${j.image} != ${GATEWAY + imgCid} (CIDv0 of ${imgPath})`);
     if (!j.properties || !j.properties.files || j.properties.files[0].uri !== j.image) p.push("properties.files[0].uri != image");
     if (p.length) { console.error("collection.json rejected:\n  " + p.join("\n  ")); process.exit(1); }
@@ -200,7 +203,7 @@ async function main() {
     files[n] = { bytes, cid };
   }
   if (problems.length) { console.error(`${problems.length} problem(s):\n  ` + problems.slice(0, 40).join("\n  ")); process.exit(1); }
-  console.log(`${tokens.length} file(s) valid: name #(N+1), Number N+1, image on ${GATEWAY}, distinct CIDs`);
+  console.log(`${tokens.length} file(s) valid: name #(N+1), Number N+1, external_url ${EXTERNAL_URL}, image on ${GATEWAY}, distinct CIDs`);
   for (const n of tokens.slice(0, 3)) console.log(`  ${n}-v3.json  ${files[n].cid}  → map "${n}": "${GATEWAY}${files[n].cid}"`);
 
   if (!EXECUTE) {
