@@ -461,6 +461,65 @@ pub mod rise_phoenix_contract {
 
         Ok(())
     }
+
+    /// ── CERT: authority-gated URI repoint (ported from capy) ──
+    /// Reads the CURRENT on-chain metadata and copies every field forward
+    /// unchanged except `uri`: name, symbol, seller_fee_basis_points, creators
+    /// (with their verified flags), collection (with its verified flag) and uses.
+    /// DataV2 is never rebuilt from source, so the verified collection membership
+    /// and the update_royalty result are preserved exactly.
+    /// `new_update_authority`, `primary_sale_happened` and `is_mutable` are passed
+    /// as None, which Metaplex treats as "leave unchanged".
+    pub fn update_token_uri(ctx: Context<UpdateTokenUri>, new_uri: String) -> Result<()> {
+        require!(!new_uri.is_empty(), PhoenixError::EmptyUri);
+        require!(
+            new_uri.len() <= anchor_spl::metadata::mpl_token_metadata::MAX_URI_LENGTH,
+            PhoenixError::UriTooLong
+        );
+
+        let bump = ctx.accounts.mint_state.bump;
+        let seeds = &[b"mint_state_v2".as_ref(), &[bump]];
+        let signer = &[&seeds[..]];
+
+        let cur = MetadataAccount::try_from(&ctx.accounts.metadata.to_account_info())?;
+        let trim = |s: &str| s.trim_end_matches('\0').to_string();
+
+        update_metadata_accounts_v2(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_metadata_program.to_account_info(),
+                UpdateMetadataAccountsV2 {
+                    metadata: ctx.accounts.metadata.to_account_info(),
+                    update_authority: ctx.accounts.mint_state.to_account_info(),
+                },
+                signer,
+            ),
+            None,
+            Some(DataV2 {
+                name: trim(&cur.name),
+                symbol: trim(&cur.symbol),
+                uri: new_uri,
+                seller_fee_basis_points: cur.seller_fee_basis_points,
+                creators: cur.creators.clone(),
+                collection: cur.collection.clone(),
+                uses: cur.uses.clone(),
+            }),
+            None,
+            None,
+        )?;
+
+        Ok(())
+    }
+}
+
+#[derive(Accounts)]
+pub struct UpdateTokenUri<'info> {
+    #[account(seeds = [b"mint_state_v2"], bump = mint_state.bump, has_one = authority)]
+    pub mint_state: Account<'info, MintState>,
+    pub authority: Signer<'info>,
+    /// CHECK: metadata PDA, validated by the Metaplex CPI
+    #[account(mut)]
+    pub metadata: UncheckedAccount<'info>,
+    pub token_metadata_program: Program<'info, Metadata>,
 }
 
 #[derive(Accounts)]
@@ -712,4 +771,8 @@ pub enum PhoenixError {
     InvalidRoyalty,
     #[msg("Creators must be 1-5 entries with shares summing to 100")]
     InvalidCreators,
+    #[msg("URI must not be empty")]
+    EmptyUri,
+    #[msg("URI exceeds the Metaplex limit of 200 bytes")]
+    UriTooLong,
 }

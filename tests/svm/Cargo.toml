@@ -1,0 +1,17 @@
+# Offline LiteSVM tests for the RISE Phoenix program.
+# Standalone workspace on purpose: its dependencies never touch the program's
+# Cargo.lock, so adding these tests cannot change the deployed binary.
+# Loads ../../target/deploy/rise_phoenix_contract.so (run `anchor build` first)
+# and fixtures/mpl_token_metadata.so. Run: cargo test --offline
+[package]
+name = "rise-svm-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dev-dependencies]
+litesvm = "0.7.1"
+solana-sdk = "2.3"
+sha2 = "0.10"
